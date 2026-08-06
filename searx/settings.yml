@@ -230,11 +230,13 @@ browser_search:
   # use the Playwright-managed Chromium binary.
   browser_channel: "chrome"
   executable_path: ""
+  # Leave empty to detect the current browser version automatically.
   user_agent: ""
   navigation_timeout: 30
   selector_timeout: 12
-  # Total browser routes attempted for one search, including the first direct
-  # request and its clean-cookie retry.
+  # Delay before retrying a recognized challenge on the same route (0-10s).
+  challenge_retry_delay: 2
+  # Total browser page attempts for one search, including same-route retries.
   max_attempts: 3
   proxy_pool:
     enabled: false

@@ -6,7 +6,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import logging
 from pathlib import Path
-import sys
+import time
 from typing import Any
 from urllib.parse import urlencode
 import threading
@@ -16,49 +16,13 @@ from .socks_bridge import Socks5AuthBridge
 
 logger = logging.getLogger(__name__)
 
-
-if sys.platform == "darwin":
-    _UA_PLATFORM = "Macintosh; Intel Mac OS X 10_15_7"
-elif sys.platform.startswith("win"):
-    _UA_PLATFORM = "Windows NT 10.0; Win64; x64"
-else:
-    _UA_PLATFORM = "X11; Linux x86_64"
-
-DEFAULT_USER_AGENT = (
-    f"Mozilla/5.0 ({_UA_PLATFORM}) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+BROWSER_ARGS = (
+    "--disable-blink-features=AutomationControlled",
+    "--no-sandbox",
+    "--disable-dev-shm-usage",
+    "--disable-infobars",
+    "--window-size=1280,800",
 )
-
-STEALTH_SCRIPT = """
-Object.defineProperty(navigator, 'webdriver', {get: () => false});
-Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
-Object.defineProperty(navigator, 'plugins', {
-  get: () => [
-    {name: 'Chrome PDF Plugin', filename: 'internal-pdf-viewer'},
-    {name: 'Chrome PDF Viewer', filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai'},
-    {name: 'Native Client', filename: 'internal-nacl-plugin'},
-  ],
-});
-if (!window.chrome) window.chrome = {};
-if (!window.chrome.runtime) {
-  window.chrome.runtime = {
-    connect() {},
-    sendMessage() {},
-    onMessage: {addListener() {}},
-  };
-}
-delete window.__playwright;
-delete window.__pw_manual;
-if (navigator.permissions && navigator.permissions.query) {
-  const originalQuery = navigator.permissions.query.bind(navigator.permissions);
-  navigator.permissions.query = (parameters) => {
-    if (parameters.name === 'notifications') {
-      return Promise.resolve({state: Notification.permission, onchange: null});
-    }
-    return originalQuery(parameters);
-  };
-}
-"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -95,14 +59,22 @@ class BrowserSearchManager:
         )
         self.selector_timeout = int(float(config.get("selector_timeout", 12)) * 1000)
         self.max_attempts = max(1, int(config.get("max_attempts", 3)))
+        try:
+            configured_retry_delay = float(config.get("challenge_retry_delay", 2))
+        except (TypeError, ValueError):
+            configured_retry_delay = 2.0
+        self.challenge_retry_delay = max(0.0, min(10.0, configured_retry_delay))
         configured_user_agent = str(config.get("user_agent", "")).strip()
-        self.user_agent = configured_user_agent or DEFAULT_USER_AGENT
+        self.user_agent = configured_user_agent or None
+        self._resolved_user_agent = self.user_agent
+        self._user_agent_checked = self.user_agent is not None
         proxy_config = config.get("proxy_pool", {}) or {}
         self.proxy_pool = ProxyPool(proxy_config.get("entries", []))
         self.proxy_pool_enabled = bool(proxy_config.get("enabled", False))
         self._lock = threading.RLock()
         self._playwright: Any = None
         self._contexts: dict[str, Any] = {}
+        self._context_locales: dict[str, str] = {}
         self._socks_bridges: dict[str, Socks5AuthBridge] = {}
 
     def start(self) -> None:
@@ -126,6 +98,7 @@ class BrowserSearchManager:
                 except Exception:  # pragma: no cover - defensive shutdown path
                     logger.exception("failed to close browser context")
             self._contexts.clear()
+            self._context_locales.clear()
             for bridge in list(self._socks_bridges.values()):
                 bridge.close()
             self._socks_bridges.clear()
@@ -138,20 +111,36 @@ class BrowserSearchManager:
         path.mkdir(parents=True, exist_ok=True)
         return path
 
-    def _launch_context(self, route: Route) -> Any:
+    @staticmethod
+    def _normalize_locale(value: str | None) -> str:
+        locale = str(value or "").strip().replace("_", "-")
+        if not locale or locale.lower() in {"all", "auto"}:
+            return "en-US"
+        parts = locale.split("-")
+        if not parts[0].isalpha() or len(parts[0]) not in {2, 3}:
+            return "en-US"
+        normalized = [parts[0].lower()]
+        for part in parts[1:]:
+            if not part.isalnum() or not 2 <= len(part) <= 8:
+                return "en-US"
+            if len(part) == 2 and part.isalpha():
+                normalized.append(part.upper())
+            elif len(part) == 4 and part.isalpha():
+                normalized.append(part.title())
+            else:
+                normalized.append(part)
+        return "-".join(normalized)
+
+    def _launch_context(self, route: Route, locale: str) -> Any:
         launch_kwargs: dict[str, Any] = {
             "headless": self.headless,
-            "args": [
-                "--disable-blink-features=AutomationControlled",
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-infobars",
-                "--window-size=1280,800",
-            ],
-            "user_agent": self.user_agent,
-            "locale": "en-US",
+            "args": list(BROWSER_ARGS),
+            "locale": locale,
             "viewport": {"width": 1280, "height": 800},
         }
+        user_agent = self._effective_user_agent()
+        if user_agent:
+            launch_kwargs["user_agent"] = user_agent
         if route.proxy:
             launch_kwargs["proxy"] = self._proxy_config(route.proxy)
         if self.executable_path:
@@ -171,8 +160,54 @@ class BrowserSearchManager:
                 )
             else:
                 raise
-        context.add_init_script(STEALTH_SCRIPT)
         return context
+
+    def _effective_user_agent(self) -> str | None:
+        if self._user_agent_checked:
+            return self._resolved_user_agent
+        self._user_agent_checked = True
+        if not self.headless:
+            return None
+
+        launch_kwargs: dict[str, Any] = {
+            "headless": True,
+            "args": list(BROWSER_ARGS),
+        }
+        if self.executable_path:
+            launch_kwargs["executable_path"] = self.executable_path
+        elif self.browser_channel:
+            launch_kwargs["channel"] = self.browser_channel
+
+        browser = None
+        try:
+            try:
+                browser = self._playwright.chromium.launch(**launch_kwargs)
+            except Exception:
+                if self.browser_channel and not self.executable_path:
+                    launch_kwargs.pop("channel", None)
+                    browser = self._playwright.chromium.launch(**launch_kwargs)
+                else:
+                    raise
+            page = browser.new_page()
+            native_user_agent = str(page.evaluate("navigator.userAgent") or "").strip()
+            self._resolved_user_agent = (
+                native_user_agent.replace("HeadlessChrome/", "Chrome/") or None
+            )
+        except Exception:
+            logger.warning(
+                "failed to detect the browser user agent; using its native value",
+                exc_info=True,
+            )
+            self._resolved_user_agent = None
+        finally:
+            if browser is not None:
+                try:
+                    browser.close()
+                except Exception:
+                    logger.debug(
+                        "failed to close user-agent probe browser", exc_info=True
+                    )
+        return self._resolved_user_agent
 
     def _proxy_config(self, proxy: ProxyEndpoint) -> dict[str, str]:
         if proxy.scheme == "socks5" and proxy.username:
@@ -184,17 +219,23 @@ class BrowserSearchManager:
             return bridge.playwright_config()
         return proxy.playwright_config()
 
-    def _context(self, route: Route, fresh: bool = False) -> Any:
-        if fresh and route.profile_key in self._contexts:
-            self._close_route(route)
+    def _context(self, route: Route, locale: str, fresh: bool = False) -> Any:
+        locale = self._normalize_locale(locale)
         context = self._contexts.get(route.profile_key)
+        if context is not None and (
+            fresh or self._context_locales.get(route.profile_key) != locale
+        ):
+            self._close_route(route, clear_cookies=fresh)
+            context = None
         if context is None:
-            context = self._launch_context(route)
+            context = self._launch_context(route, locale)
             self._contexts[route.profile_key] = context
+            self._context_locales[route.profile_key] = locale
         return context
 
-    def _close_route(self, route: Route, clear_cookies: bool = True) -> None:
+    def _close_route(self, route: Route, clear_cookies: bool = False) -> None:
         context = self._contexts.pop(route.profile_key, None)
+        self._context_locales.pop(route.profile_key, None)
         if context is None:
             return
         if clear_cookies:
@@ -211,10 +252,11 @@ class BrowserSearchManager:
 
     @staticmethod
     def _google_url(request: SearchRequest) -> str:
+        locale = BrowserSearchManager._normalize_locale(request.locale)
         params: dict[str, str] = {
             "q": request.query,
             "num": "10",
-            "hl": request.locale.split("-")[0] if request.locale else "en",
+            "hl": locale.split("-")[0],
             "filter": "0",
         }
         if request.pageno > 1:
@@ -236,19 +278,38 @@ class BrowserSearchManager:
     def _block_reason(cls, page: Any) -> str | None:
         url = str(getattr(page, "url", "")).lower()
         text = cls._page_text(page).lower()
-        if any(marker in url for marker in ("/sorry/", "captcha", "consent.google")):
+        if any(marker in url for marker in ("/sorry/", "/challenge/", "captcha")):
             return "google_challenge_url"
+        if "consent.google" in url:
+            return "consent_required"
         checks = (
             ("unusual traffic", "unusual_traffic"),
             ("our systems have detected unusual traffic", "unusual_traffic"),
+            ("检测到异常流量", "unusual_traffic"),
+            ("我们的系统检测到来自您的计算机网络的异常流量", "unusual_traffic"),
             ("enable javascript", "javascript_required"),
             ("update your browser", "browser_update_required"),
             ("i'm not a robot", "captcha"),
             ("recaptcha", "captcha"),
+            ("请验证您不是机器人", "captcha"),
+            ("确认您不是机器人", "captcha"),
+            ("在继续使用 google 之前", "consent_required"),
+            ("before you continue to google", "consent_required"),
         )
         for marker, reason in checks:
             if marker in text:
                 return reason
+        for selector in (
+            "form#captcha-form",
+            "iframe[src*='recaptcha']",
+            "iframe[src*='captcha']",
+            "[id*='captcha']",
+        ):
+            try:
+                if page.locator(selector).count() > 0:
+                    return "captcha"
+            except Exception:
+                continue
         return None
 
     @staticmethod
@@ -257,6 +318,9 @@ class BrowserSearchManager:
             'button:has-text("Accept all")',
             'button:has-text("I agree")',
             'button:has-text("同意")',
+            'button:has-text("接受全部")',
+            'button:has-text("全部接受")',
+            '[aria-label="Accept all"]',
         )
         for selector in selectors:
             try:
@@ -305,10 +369,24 @@ class BrowserSearchManager:
             limit,
         )
 
+    @staticmethod
+    def _is_transport_error(exc: Exception) -> bool:
+        message = str(exc).lower()
+        return any(
+            marker in message
+            for marker in (
+                "err_connection_closed",
+                "err_connection_reset",
+                "err_proxy_connection_failed",
+                "err_timed_out",
+                "err_name_not_resolved",
+            )
+        )
+
     def _perform(
         self, request: SearchRequest, route: Route, fresh: bool = False
     ) -> dict[str, Any]:
-        context = self._context(route, fresh=fresh)
+        context = self._context(route, request.locale, fresh=fresh)
         page = context.new_page()
         try:
             response = page.goto(
@@ -373,6 +451,14 @@ class BrowserSearchManager:
                     "reason": reason,
                     "route": route.name,
                 }
+            if self._is_transport_error(exc):
+                return {
+                    "ok": False,
+                    "status": "route_error",
+                    "reason": "transport_error",
+                    "detail": str(exc),
+                    "route": route.name,
+                }
             return {
                 "ok": False,
                 "status": "error",
@@ -386,48 +472,85 @@ class BrowserSearchManager:
                 pass
 
     def search(self, request: SearchRequest) -> dict[str, Any]:
-        """Search once, rotating routes only after a recognized block."""
+        """Search while preserving a route once before cleaning or rotating."""
 
         with self._lock:
 
             def finish(result: dict[str, Any], attempts: int) -> dict[str, Any]:
                 return {**result, "attempts": attempts}
 
-            def recoverable(result: dict[str, Any]) -> bool:
-                return result.get("status") in {"blocked", "rate_limited"}
+            def route_failure(result: dict[str, Any]) -> bool:
+                return result.get("status") in {
+                    "blocked",
+                    "rate_limited",
+                    "route_error",
+                }
+
+            def challenge(result: dict[str, Any]) -> bool:
+                return result.get("reason") in {
+                    "google_challenge_url",
+                    "captcha",
+                    "consent_required",
+                    "unusual_traffic",
+                }
+
+            def browser_configuration_failure(result: dict[str, Any]) -> bool:
+                return result.get("reason") in {
+                    "javascript_required",
+                    "browser_update_required",
+                }
+
+            def settle_route(
+                route: Route, result: dict[str, Any], attempts: int
+            ) -> tuple[dict[str, Any], int]:
+                if result.get("ok") or not route_failure(result):
+                    return result, attempts
+                if browser_configuration_failure(result):
+                    self._close_route(route, clear_cookies=False)
+                    return result, attempts
+                if challenge(result) and attempts < self.max_attempts:
+                    if self.challenge_retry_delay:
+                        time.sleep(self.challenge_retry_delay)
+                    result = self._perform(request, route)
+                    attempts += 1
+                    if result.get("ok") or not route_failure(result):
+                        return result, attempts
+                    if challenge(result):
+                        self._close_route(route, clear_cookies=True)
+                    else:
+                        self._close_route(route, clear_cookies=False)
+                    return result, attempts
+                self._close_route(route, clear_cookies=False)
+                return result, attempts
 
             self.start()
             direct = Route("direct", "google-direct")
             result = self._perform(request, direct)
             attempts = 1
-            if result.get("ok") or not recoverable(result):
+            result, attempts = settle_route(direct, result, attempts)
+            if (
+                result.get("ok")
+                or not route_failure(result)
+                or browser_configuration_failure(result)
+            ):
                 return finish(result, attempts)
-
-            self._close_route(direct)
             if attempts >= self.max_attempts:
                 return finish(result, attempts)
 
-            result = self._perform(request, direct, fresh=True)
-            attempts += 1
-            if result.get("ok") or not recoverable(result):
-                return finish(result, attempts)
-
-            self._close_route(direct)
             if not self.proxy_pool_enabled:
                 return finish(result, attempts)
 
-            last_route: Route | None = None
             for proxy in self.proxy_pool.round():
                 if attempts >= self.max_attempts:
                     break
                 route = Route(proxy.display_name, proxy.key, proxy)
-                last_route = route
-                self._close_route(route)
-                result = self._perform(request, route, fresh=True)
+                result = self._perform(request, route)
                 attempts += 1
-                if result.get("ok") or not recoverable(result):
+                result, attempts = settle_route(route, result, attempts)
+                if (
+                    result.get("ok")
+                    or not route_failure(result)
+                    or browser_configuration_failure(result)
+                ):
                     return finish(result, attempts)
-                self._close_route(route)
-            if last_route is not None:
-                self._close_route(last_route)
             return finish(result, attempts)

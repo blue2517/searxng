@@ -278,6 +278,7 @@ SCHEMA: dict[str, t.Any] = {
         'user_agent': SettingsValue(str, ''),
         'navigation_timeout': SettingsValue(numbers.Real, 30),
         'selector_timeout': SettingsValue(numbers.Real, 12),
+        'challenge_retry_delay': SettingsValue(numbers.Real, 2),
         'max_attempts': SettingsValue(int, 3),
         'proxy_pool': {
             'enabled': SettingsValue(bool, False),
