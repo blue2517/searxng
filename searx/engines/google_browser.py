@@ -26,6 +26,8 @@ max_page = 50
 time_range_support = True
 language_support = True
 safesearch = True
+# The engine talks to the loopback browser worker over HTTP.
+enable_http = True
 
 about = EngineAbout(
     website="https://www.google.com",
