@@ -1,0 +1,23 @@
+[Unit]
+Description=SearXNG browser search worker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=searxng
+Group=searxng
+WorkingDirectory=/usr/local/searxng
+Environment=SEARXNG_SETTINGS_PATH=/etc/searxng/settings.yml
+Environment=PLAYWRIGHT_BROWSERS_PATH=/var/lib/searxng/playwright
+ExecStart=/usr/local/searxng/.venv/bin/searxng-browser-search
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/var/lib/searxng/browser-profiles /var/lib/searxng/playwright
+
+[Install]
+WantedBy=multi-user.target
