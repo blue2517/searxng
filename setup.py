@@ -15,6 +15,9 @@ with open('requirements.txt') as f:
 with open('requirements-dev.txt') as f:
     dev_requirements = [l.strip() for l in f.readlines()]
 
+with open('requirements-browser-search.txt') as f:
+    browser_search_requirements = [l.strip() for l in f.readlines()]
+
 setup(
     name='searxng',
     description="SearXNG is a metasearch engine. Users are neither tracked nor profiled.",
@@ -39,7 +42,10 @@ setup(
     ],
     project_urls={"Code": GIT_URL, "Issue tracker": get_setting('brand.issue_url')},
     entry_points={
-        'console_scripts': ['searxng-run = searx.webapp:run']
+        'console_scripts': [
+            'searxng-run = searx.webapp:run',
+            'searxng-browser-search = searx.browser_search.server:main',
+        ]
     },
     packages=find_packages(
         include=[
@@ -65,5 +71,8 @@ setup(
         ],
     },
     install_requires=requirements,
-    extras_require={'test': dev_requirements},
+    extras_require={
+        'test': dev_requirements,
+        'browser-search': browser_search_requirements,
+    },
 )

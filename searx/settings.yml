@@ -218,6 +218,28 @@ outgoing:
   #    - 1.1.1.2
   #    - fe80::/126
 
+# Optional server-side browser search worker. It is disabled by default.
+browser_search:
+  enabled: false
+  bind_address: "127.0.0.1"
+  port: 8890
+  endpoint: "http://127.0.0.1:8890"
+  profile_dir: "/var/lib/searxng/browser-profiles"
+  headless: true
+  # Set to "chrome" when a system Google Chrome is installed. Leave empty to
+  # use the Playwright-managed Chromium binary.
+  browser_channel: "chrome"
+  executable_path: ""
+  user_agent: ""
+  navigation_timeout: 30
+  selector_timeout: 12
+  # Total browser routes attempted for one search, including the first direct
+  # request and its clean-cookie retry.
+  max_attempts: 3
+  proxy_pool:
+    enabled: false
+    entries: []
+
 
 # Plugin configuration, for more details see
 #   https://docs.searxng.org/admin/settings/settings_plugins.html
@@ -1218,6 +1240,13 @@ engines:
     engine: google
     shortcut: go
     inactive: true
+
+  - name: google browser
+    engine: google_browser
+    shortcut: gob
+    categories: [general, web]
+    disabled: true
+    timeout: 135.0
 
   - name: google images
     engine: google_images

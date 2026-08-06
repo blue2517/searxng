@@ -12,6 +12,7 @@ Administrator documentation
    installation-searxng
    installation-granian
    installation-uwsgi
+   browser-search
    installation-nginx
    installation-apache
    update-searxng
