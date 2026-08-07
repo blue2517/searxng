@@ -1250,6 +1250,13 @@ engines:
     disabled: true
     timeout: 135.0
 
+  - name: duckduckgo browser
+    engine: duckduckgo_browser
+    shortcut: ddgb
+    categories: [general, web]
+    disabled: true
+    timeout: 135.0
+
   - name: google images
     engine: google_images
     shortcut: goi

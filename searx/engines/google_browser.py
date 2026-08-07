@@ -46,6 +46,7 @@ def request(query: str, params: "OnlineParams") -> None:
     params["url"] = endpoint + "/v1/search"
     params["headers"]["Content-Type"] = "application/json"
     params["json"] = {
+        "engine": "google",
         "query": query,
         "pageno": params["pageno"],
         "locale": params.get("searxng_locale", "en-US"),

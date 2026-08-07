@@ -9,8 +9,9 @@ import logging
 import signal
 import threading
 from typing import Any
+from socketserver import ThreadingMixIn
 
-from .manager import BrowserSearchManager, SearchRequest
+from .manager import BrowserSearchDispatcher, SearchRequest
 
 logger = logging.getLogger(__name__)
 
@@ -21,8 +22,10 @@ def _config() -> dict[str, Any]:
     return dict(get_setting("browser_search", {}))
 
 
-class BrowserSearchHTTPServer(HTTPServer):
-    def __init__(self, address: tuple[str, int], manager: BrowserSearchManager):
+class BrowserSearchHTTPServer(ThreadingMixIn, HTTPServer):
+    daemon_threads = True
+
+    def __init__(self, address: tuple[str, int], manager: BrowserSearchDispatcher):
         super().__init__(address, BrowserSearchHandler)
         self.manager = manager
 
@@ -59,12 +62,16 @@ class BrowserSearchHandler(BaseHTTPRequestHandler):
             query = str(payload.get("query", "")).strip()
             if not query or len(query) > 2000:
                 raise ValueError("query must contain 1-2000 characters")
+            engine = str(payload.get("engine", "google")).strip().lower()
+            if engine not in {"google", "duckduckgo"}:
+                raise ValueError(f"unsupported browser search engine: {engine}")
             request = SearchRequest(
                 query=query,
                 pageno=max(1, min(int(payload.get("pageno", 1)), 50)),
                 locale=str(payload.get("locale", "en-US"))[:32],
                 safesearch=max(0, min(int(payload.get("safesearch", 0)), 2)),
                 time_range=payload.get("time_range") or None,
+                engine=engine,
             )
             result = self.server.manager.search(request)
             self._send(200 if result.get("ok") else 502, result)
@@ -84,7 +91,7 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO)
     host = str(config.get("bind_address", "127.0.0.1"))
     port = int(config.get("port", 8890))
-    manager = BrowserSearchManager(config)
+    manager = BrowserSearchDispatcher(config)
     server = BrowserSearchHTTPServer((host, port), manager)
 
     def request_shutdown(*_: Any) -> None:

@@ -6,6 +6,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import logging
 from pathlib import Path
+import queue
 import time
 from typing import Any
 from urllib.parse import urlencode
@@ -32,6 +33,7 @@ class SearchRequest:
     locale: str = "en-US"
     safesearch: int = 0
     time_range: str | None = None
+    engine: str = "google"
 
 
 @dataclass(frozen=True, slots=True)
@@ -268,6 +270,24 @@ class BrowserSearchManager:
         return "https://www.google.com/search?" + urlencode(params)
 
     @staticmethod
+    def _duckduckgo_url(request: SearchRequest) -> str:
+        """Build the JavaScript search page URL used by the browser worker."""
+
+        locale = BrowserSearchManager._normalize_locale(request.locale)
+        params: dict[str, str] = {
+            "q": request.query,
+            "kl": locale.lower(),
+            # DuckDuckGo uses -2 for off, -1 for moderate and 1 for strict.
+            "kp": {0: "-2", 1: "-1", 2: "1"}.get(request.safesearch, "-2"),
+        }
+        if request.pageno > 1:
+            # The browser page accepts the same offset parameter as its web UI.
+            params["s"] = str((request.pageno - 1) * 10)
+        if request.time_range in {"day", "week", "month", "year"}:
+            params["df"] = request.time_range[0]
+        return "https://duckduckgo.com/?" + urlencode(params)
+
+    @staticmethod
     def _page_text(page: Any) -> str:
         try:
             return str(page.locator("body").inner_text(timeout=3000))[:12000]
@@ -275,9 +295,36 @@ class BrowserSearchManager:
             return ""
 
     @classmethod
-    def _block_reason(cls, page: Any) -> str | None:
+    def _block_reason(cls, page: Any, engine: str = "google") -> str | None:
         url = str(getattr(page, "url", "")).lower()
         text = cls._page_text(page).lower()
+        if engine == "duckduckgo":
+            if any(marker in url for marker in ("/anomaly", "/challenge", "captcha")):
+                return "duckduckgo_challenge_url"
+            checks = (
+                ("unfortunately, bots use duckduckgo too", "captcha"),
+                ("please complete the following challenge", "captcha"),
+                ("are you a robot", "captcha"),
+                ("检测到异常流量", "unusual_traffic"),
+                ("验证您不是机器人", "captcha"),
+                ("enable javascript", "javascript_required"),
+                ("update your browser", "browser_update_required"),
+            )
+            for marker, reason in checks:
+                if marker in text:
+                    return reason
+            for selector in (
+                "#anomaly-modal",
+                "form#challenge-form",
+                "iframe[src*='captcha']",
+                "[data-testid='challenge']",
+            ):
+                try:
+                    if page.locator(selector).count() > 0:
+                        return "captcha"
+                except Exception:
+                    continue
+            return None
         if any(marker in url for marker in ("/sorry/", "/challenge/", "captcha")):
             return "google_challenge_url"
         if "consent.google" in url:
@@ -332,7 +379,42 @@ class BrowserSearchManager:
                 continue
 
     @staticmethod
-    def _extract_results(page: Any, limit: int = 10) -> list[dict[str, str]]:
+    def _extract_results(
+        page: Any, limit: int = 10, engine: str = "google"
+    ) -> list[dict[str, str]]:
+        if engine == "duckduckgo":
+            return page.evaluate(
+                """
+                (limit) => {
+                  const text = (el) => (el?.innerText || el?.textContent || '').trim();
+                  const out = [];
+                  const seen = new Set();
+                  const boxes = document.querySelectorAll(
+                    'article[data-testid="result"], [data-testid="mainline"] article, article'
+                  );
+                  for (const box of boxes) {
+                    if (out.length >= limit) break;
+                    const anchor = box.querySelector(
+                      'a[data-testid="result-title-a"], h2 a[href^="http"]'
+                    );
+                    if (!anchor || !anchor.href) continue;
+                    let parsed;
+                    try { parsed = new URL(anchor.href); } catch { continue; }
+                    if (parsed.hostname.endsWith('duckduckgo.com')) continue;
+                    if (seen.has(anchor.href)) continue;
+                    const snippet = box.querySelector(
+                      '[data-result="snippet"], [data-testid="result-snippet"], .result__snippet'
+                    );
+                    const title = text(anchor);
+                    if (!title) continue;
+                    seen.add(anchor.href);
+                    out.push({title, url: anchor.href, content: text(snippet)});
+                  }
+                  return out;
+                }
+                """,
+                limit,
+            )
         return page.evaluate(
             """
             (limit) => {
@@ -389,8 +471,21 @@ class BrowserSearchManager:
         context = self._context(route, request.locale, fresh=fresh)
         page = context.new_page()
         try:
+            engine = request.engine or "google"
+            if engine not in {"google", "duckduckgo"}:
+                return {
+                    "ok": False,
+                    "status": "invalid_request",
+                    "reason": f"unsupported_engine:{engine}",
+                    "route": route.name,
+                }
+            url = (
+                self._duckduckgo_url(request)
+                if engine == "duckduckgo"
+                else self._google_url(request)
+            )
             response = page.goto(
-                self._google_url(request),
+                url,
                 wait_until="domcontentloaded",
                 timeout=self.navigation_timeout,
             )
@@ -409,7 +504,7 @@ class BrowserSearchManager:
                     "route": route.name,
                 }
             self._dismiss_consent(page)
-            reason = self._block_reason(page)
+            reason = self._block_reason(page, engine)
             if reason:
                 return {
                     "ok": False,
@@ -419,10 +514,16 @@ class BrowserSearchManager:
                 }
             try:
                 page.wait_for_selector(
-                    "div#search h3, div#rso h3", timeout=self.selector_timeout
+                    (
+                        "article[data-testid='result'], [data-testid='mainline'] article, "
+                        "article"
+                        if engine == "duckduckgo"
+                        else "div#search h3, div#rso h3"
+                    ),
+                    timeout=self.selector_timeout,
                 )
             except Exception:
-                reason = self._block_reason(page)
+                reason = self._block_reason(page, engine)
                 if reason:
                     return {
                         "ok": False,
@@ -430,10 +531,15 @@ class BrowserSearchManager:
                         "reason": reason,
                         "route": route.name,
                     }
-            results = self._extract_results(page)
+            results = self._extract_results(page, engine=engine)
             if not results:
                 page_text = self._page_text(page).lower()
-                no_results_markers = ("did not match any documents", "找不到和您查询的")
+                no_results_markers = (
+                    "did not match any documents",
+                    "找不到和您查询的",
+                    "no results found",
+                    "没有找到结果",
+                )
                 if not any(marker in page_text for marker in no_results_markers):
                     return {
                         "ok": False,
@@ -443,7 +549,7 @@ class BrowserSearchManager:
                     }
             return {"ok": True, "status": "ok", "route": route.name, "results": results}
         except Exception as exc:
-            reason = self._block_reason(page)
+            reason = self._block_reason(page, request.engine or "google")
             if reason:
                 return {
                     "ok": False,
@@ -489,6 +595,7 @@ class BrowserSearchManager:
             def challenge(result: dict[str, Any]) -> bool:
                 return result.get("reason") in {
                     "google_challenge_url",
+                    "duckduckgo_challenge_url",
                     "captcha",
                     "consent_required",
                     "unusual_traffic",
@@ -524,7 +631,8 @@ class BrowserSearchManager:
                 return result, attempts
 
             self.start()
-            direct = Route("direct", "google-direct")
+            engine = request.engine or "google"
+            direct = Route("direct", f"{engine}-direct")
             result = self._perform(request, direct)
             attempts = 1
             result, attempts = settle_route(direct, result, attempts)
@@ -543,7 +651,7 @@ class BrowserSearchManager:
             for proxy in self.proxy_pool.round():
                 if attempts >= self.max_attempts:
                     break
-                route = Route(proxy.display_name, proxy.key, proxy)
+                route = Route(proxy.display_name, f"{engine}-{proxy.key}", proxy)
                 result = self._perform(request, route)
                 attempts += 1
                 result, attempts = settle_route(route, result, attempts)
@@ -554,3 +662,101 @@ class BrowserSearchManager:
                 ):
                     return finish(result, attempts)
             return finish(result, attempts)
+
+
+class _BrowserSearchLane:
+    """Own one synchronous Playwright manager on one dedicated thread."""
+
+    def __init__(self, config: dict[str, Any], engine: str):
+        self._queue: queue.Queue[Any] = queue.Queue()
+        self._thread = threading.Thread(
+            target=self._run,
+            name=f"browser-search-{engine}",
+            daemon=True,
+        )
+        self._config = config
+        self.engine = engine
+        self._thread.start()
+
+    def _run(self) -> None:
+        manager: BrowserSearchManager | None = None
+        try:
+            manager = BrowserSearchManager(self._config)
+            while True:
+                item = self._queue.get()
+                if item is None:
+                    break
+                request, event, result = item
+                try:
+                    result.append(manager.search(request))
+                except Exception as exc:  # pragma: no cover - service boundary
+                    logger.exception("browser search lane failed")
+                    result.append(
+                        {
+                            "ok": False,
+                            "status": "error",
+                            "reason": str(exc),
+                        }
+                    )
+                finally:
+                    event.set()
+        finally:
+            if manager is not None:
+                manager.close()
+
+    def search(self, request: SearchRequest) -> dict[str, Any]:
+        event = threading.Event()
+        result: list[dict[str, Any]] = []
+        self._queue.put((request, event, result))
+        event.wait()
+        return result[0]
+
+    def close(self) -> None:
+        if self._thread.is_alive():
+            self._queue.put(None)
+            self._thread.join(timeout=30)
+
+
+class BrowserSearchDispatcher:
+    """Dispatch independent search engines to independent browser lanes."""
+
+    SUPPORTED_ENGINES = frozenset({"google", "duckduckgo"})
+
+    def __init__(self, config: dict[str, Any]):
+        self.config = config
+        self._lanes: dict[str, _BrowserSearchLane] = {}
+        self._lock = threading.RLock()
+
+    def _lane(self, engine: str) -> _BrowserSearchLane:
+        with self._lock:
+            lane = self._lanes.get(engine)
+            if lane is None:
+                lane = _BrowserSearchLane(self.config, engine)
+                self._lanes[engine] = lane
+            return lane
+
+    def search(self, request: SearchRequest) -> dict[str, Any]:
+        engine = (request.engine or "google").strip().lower()
+        if engine not in self.SUPPORTED_ENGINES:
+            return {
+                "ok": False,
+                "status": "invalid_request",
+                "reason": f"unsupported_engine:{engine}",
+            }
+        if engine != request.engine:
+            request = SearchRequest(
+                query=request.query,
+                pageno=request.pageno,
+                locale=request.locale,
+                safesearch=request.safesearch,
+                time_range=request.time_range,
+                engine=engine,
+            )
+        return self._lane(engine).search(request)
+
+    def close(self) -> None:
+        with self._lock:
+            lanes = list(self._lanes.values())
+            self._lanes.clear()
+        for lane in lanes:
+            lane.close()

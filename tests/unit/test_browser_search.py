@@ -14,7 +14,7 @@ from searx.browser_search.manager import (
 from searx.browser_search.proxy_pool import ProxyEndpoint, ProxyPool
 from searx.browser_search.socks_bridge import Socks5AuthBridge
 from searx.browser_search.server import BrowserSearchHTTPServer
-from searx.engines import google_browser
+from searx.engines import duckduckgo_browser, google_browser
 
 
 class ProxyPoolTests(TestCase):
@@ -111,6 +111,25 @@ class BrowserManagerTests(TestCase):
         self.assertIn("safe=active", url)
         self.assertIn("tbs=qdr%3Aw", url)
 
+    def test_duckduckgo_url_encodes_query_and_filters(self):
+        url = BrowserSearchManager._duckduckgo_url(
+            SearchRequest(
+                "卡莲 奥尔黛西亚",
+                pageno=2,
+                locale="zh-CN",
+                safesearch=2,
+                time_range="week",
+                engine="duckduckgo",
+            )
+        )
+        self.assertIn(
+            "q=%E5%8D%A1%E8%8E%B2+%E5%A5%A5%E5%B0%94%E9%BB%9B%E8%A5%BF%E4%BA%9A", url
+        )
+        self.assertIn("kl=zh-cn", url)
+        self.assertIn("kp=1", url)
+        self.assertIn("s=10", url)
+        self.assertIn("df=w", url)
+
     def test_locale_normalization(self):
         self.assertEqual("zh-CN", BrowserSearchManager._normalize_locale("zh_cn"))
         self.assertEqual(
@@ -174,6 +193,27 @@ class BrowserManagerTests(TestCase):
         page.locator.return_value.inner_text.return_value = ""
         page.locator.return_value.count.return_value = 1
         self.assertEqual("captcha", BrowserSearchManager._block_reason(page))
+
+    def test_duckduckgo_block_reason_detects_bot_challenge(self):
+        page = Mock()
+        page.url = "https://duckduckgo.com/?q=test"
+        page.locator.return_value.inner_text.return_value = (
+            "Unfortunately, bots use DuckDuckGo too."
+        )
+        self.assertEqual(
+            "captcha", BrowserSearchManager._block_reason(page, "duckduckgo")
+        )
+
+    def test_duckduckgo_extractor_uses_rendered_page(self):
+        page = Mock()
+        page.evaluate.return_value = [
+            {"title": "Title", "url": "https://example.test", "content": "Snippet"}
+        ]
+        results = BrowserSearchManager._extract_results(
+            page, engine="duckduckgo"
+        )
+        self.assertEqual("https://example.test", results[0]["url"])
+        page.evaluate.assert_called_once()
 
     def test_challenge_retry_delay_is_bounded(self):
         self.assertEqual(
@@ -352,8 +392,8 @@ class BrowserManagerTests(TestCase):
 
 class BrowserServerTests(TestCase):
 
-    def test_http_server_keeps_playwright_on_one_thread(self):
-        self.assertFalse(issubclass(BrowserSearchHTTPServer, ThreadingMixIn))
+    def test_http_server_accepts_parallel_lane_requests(self):
+        self.assertTrue(issubclass(BrowserSearchHTTPServer, ThreadingMixIn))
 
 
 class GoogleBrowserEngineTests(TestCase):
@@ -371,6 +411,7 @@ class GoogleBrowserEngineTests(TestCase):
         self.assertTrue(params["url"].endswith("/v1/search"))
         self.assertEqual("卡莲", params["json"]["query"])
         self.assertEqual("zh-CN", params["json"]["locale"])
+        self.assertEqual("google", params["json"]["engine"])
 
     def test_response_maps_results(self):
         response = Mock()
@@ -381,5 +422,34 @@ class GoogleBrowserEngineTests(TestCase):
             ],
         }
         results = google_browser.response(response)
+        self.assertEqual(1, len(results))
+        self.assertEqual("https://example.test", results[0]["url"])
+
+
+class DuckDuckGoBrowserEngineTests(TestCase):
+
+    def test_request_builds_worker_payload(self):
+        params = {
+            "headers": {},
+            "pageno": 1,
+            "searxng_locale": "zh-CN",
+            "safesearch": 0,
+            "time_range": None,
+        }
+        duckduckgo_browser.request("卡莲", params)
+        self.assertEqual("POST", params["method"])
+        self.assertTrue(params["url"].endswith("/v1/search"))
+        self.assertEqual("duckduckgo", params["json"]["engine"])
+        self.assertEqual("卡莲", params["json"]["query"])
+
+    def test_response_maps_results(self):
+        response = Mock()
+        response.json.return_value = {
+            "ok": True,
+            "results": [
+                {"title": "Title", "url": "https://example.test", "content": "Snippet"}
+            ],
+        }
+        results = duckduckgo_browser.response(response)
         self.assertEqual(1, len(results))
         self.assertEqual("https://example.test", results[0]["url"])
