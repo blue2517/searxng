@@ -266,6 +266,9 @@ class Result(msgspec.Struct, kw_only=True):
     The field is optional and is initialized from the context if necessary.
     """
 
+    domain: str = ""
+    """Pure domain name of the result."""
+
     def normalize_result_fields(self):
         """Normalize fields ``url`` and ``parse_sql``.
 
@@ -497,6 +500,7 @@ class LegacyResult(dict[str, t.Any]):
         self["template"] = self.get("template", "default.html")
         self["engine"] = self.get("engine", "")
         self["parsed_url"] = self.get("parsed_url")
+        self["domain"] = self.get("domain", "")
 
         # emulate field types from type class MainResult
         self["title"] = self.get("title", "")

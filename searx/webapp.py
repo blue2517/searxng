@@ -7,6 +7,7 @@ import json
 import os
 import sys
 import base64
+from hmac import compare_digest
 
 from timeit import default_timer
 from html import escape
@@ -117,6 +118,7 @@ from searx.valkeydb import initialize as valkey_initialize
 from searx.sxng_locales import sxng_locales
 import searx.search
 from searx.network import stream as http_stream, set_context_network_name
+from searx import server_config
 
 
 logger = logger.getChild('webapp')
@@ -149,6 +151,29 @@ app.jinja_env.lstrip_blocks = True
 app.jinja_env.add_extension('jinja2.ext.loopcontrols')  # pylint: disable=no-member
 app.jinja_env.filters['group_engines_in_tab'] = group_engines_in_tab  # pylint: disable=no-member
 app.secret_key = settings['server']['secret_key']
+
+
+def _check_basic_auth():
+    """Validate the optional HTTP Basic Auth settings for the public service."""
+    username = settings['server'].get('auth_username')
+    password = settings['server'].get('auth_password')
+    if not username or not password:
+        return None
+
+    authorization = sxng_request.authorization
+    if (
+        not authorization
+        or not compare_digest(authorization.username or '', str(username))
+        or not compare_digest(authorization.password or '', str(password))
+    ):
+        return Response(
+            'Authentication required',
+            status=401,
+            headers={'WWW-Authenticate': 'Basic realm="SearXNG"'},
+            mimetype='text/plain',
+        )
+
+    return None
 
 
 def get_locale():
@@ -460,6 +485,10 @@ def pre_request():
     sxng_request.render_time = 0  # pylint: disable=assigning-non-slot
     sxng_request.timings = []  # pylint: disable=assigning-non-slot
     sxng_request.errors = []  # pylint: disable=assigning-non-slot
+
+    auth_error = _check_basic_auth()
+    if auth_error:
+        return auth_error
 
     client_pref = ClientPref.from_http_request(sxng_request)
     # pylint: disable=redefined-outer-name
@@ -980,8 +1009,25 @@ def preferences():
         preferences_url_params = sxng_request.preferences.get_as_url_params(),
         locked_preferences = get_setting("preferences").lock,
         doi_resolvers = get_setting("doi_resolvers", {}),
+        server_config = server_config.snapshot(),
+        server_saved = sxng_request.args.get('server_saved') == '1',
+        server_admin_enabled = bool(settings['server'].get('auth_username') and settings['server'].get('auth_password')),
         # fmt: on
     )
+
+
+@app.route('/preferences/server', methods=['POST'])
+def save_server_preferences():
+    """Persist administrator settings and reload this SearXNG process."""
+
+    if not settings['server'].get('auth_username') or not settings['server'].get('auth_password'):
+        return Response('Server settings require HTTP Basic Auth', status=403, mimetype='text/plain')
+    try:
+        server_config.save(sxng_request.form)
+    except (OSError, RuntimeError, ValueError) as exc:
+        logger.exception("failed to save server preferences")
+        return Response(f"Server settings could not be saved: {escape(str(exc))}", status=400, mimetype='text/plain')
+    return redirect(url_for('preferences', server_saved='1'))
 
 
 app.add_url_rule('/favicon_proxy', methods=['GET'], endpoint="favicon_proxy", view_func=favicons.favicon_proxy)

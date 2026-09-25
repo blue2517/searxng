@@ -391,6 +391,25 @@ def response(resp: "SXNG_Response"):
 
             if raw_url.startswith('/url?q='):
                 url = unquote(raw_url[7:].split("&sa=U")[0])  # remove the google redirector
+            elif raw_url.startswith('/url?url='):
+                url = unquote(raw_url[9:].split("&sa=U")[0])
+            elif raw_url.startswith('/goto?') or 'google.com/goto' in raw_url:
+                cite_nodes = eval_xpath(result, './/cite | ../..//cite')
+                extracted_url = None
+                if cite_nodes:
+                    cite_text = extract_text(cite_nodes[0]).split(' · ')[0].strip()
+                    cleaned = re.sub(r'\s*[›>»]\s*', '/', cite_text).lstrip('/')
+                    if cleaned:
+                        if not cleaned.startswith(('http://', 'https://')):
+                            cleaned = 'https://' + cleaned
+                        try:
+                            from urllib.parse import urlparse
+                            parsed_c = urlparse(cleaned)
+                            if parsed_c.netloc and '.' in parsed_c.netloc and 'google.com' not in parsed_c.netloc:
+                                extracted_url = cleaned
+                        except Exception:
+                            pass
+                url = extracted_url or raw_url
             else:
                 url = raw_url
 
@@ -412,7 +431,25 @@ def response(resp: "SXNG_Response"):
                     if img_id:
                         thumbnail = data_image_map.get(img_id)
 
-            results.append({"url": url, "title": title, "content": content or '', "thumbnail": thumbnail})
+            res_item = {"url": url, "title": title, "content": content or '', "thumbnail": thumbnail}
+            domain = ""
+            cite_nodes = eval_xpath(result, './/cite | ../..//cite')
+            if cite_nodes:
+                cite_text = extract_text(cite_nodes[0]).strip()
+                if cite_text:
+                    try:
+                        first_part = re.split(r'\s+[›>»·•\s]\s+', cite_text)[0].strip()
+                        if first_part.startswith(('http://', 'https://')):
+                            domain = urlparse(first_part).hostname or ""
+                        elif first_part:
+                            raw_host = first_part.split('/')[0].strip()
+                            if raw_host:
+                                domain = urlparse('https://' + raw_host).hostname or ""
+                    except Exception:
+                        pass
+            if domain:
+                res_item["domain"] = domain
+            results.append(res_item)
 
         except Exception as e:  # pylint: disable=broad-except
             logger.error(e, exc_info=True)

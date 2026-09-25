@@ -19,7 +19,17 @@ logger = logging.getLogger(__name__)
 def _config() -> dict[str, Any]:
     from searx import get_setting
 
-    return dict(get_setting("browser_search", {}))
+    config = dict(get_setting("browser_search", {}))
+    bp = config.get("proxy_pool") or {}
+    if not bp.get("entries"):
+        outgoing_pp = get_setting("outgoing.proxy_pool", {}) or {}
+        if outgoing_pp.get("entries"):
+            config["proxy_pool"] = {
+                "enabled": bool(outgoing_pp.get("enabled", False)),
+                "entries": list(outgoing_pp.get("entries", [])),
+                "max_attempts": outgoing_pp.get("max_attempts", 3),
+            }
+    return config
 
 
 class BrowserSearchHTTPServer(ThreadingMixIn, HTTPServer):

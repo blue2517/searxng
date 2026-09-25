@@ -218,6 +218,13 @@ outgoing:
   #    - 1.1.1.2
   #    - fe80::/126
 
+  # Optional HTTP engine recovery pool. The direct request is attempted first;
+  # a challenge or proxy failure rotates to another entry, up to three attempts.
+  proxy_pool:
+    enabled: false
+    max_attempts: 3
+    entries: []
+
 # Optional server-side browser search worker. It is disabled by default.
 browser_search:
   enabled: false
@@ -226,6 +233,15 @@ browser_search:
   endpoint: "http://127.0.0.1:8890"
   profile_dir: "/var/lib/searxng/browser-profiles"
   headless: true
+  # Keep browser contexts warm so the first search does not pay Chrome startup cost.
+  prewarm: true
+  prewarm_locale: "zh-CN"
+  # Google and DuckDuckGo share one Chromium instance. This limits active pages;
+  # extra requests wait in the async runtime queue.
+  max_concurrent_pages: 2
+  # Google is serialized so one search batch does not create a burst of pages.
+  google_max_concurrent_pages: 1
+  reuse_context_locale: true
   # Set to "chrome" when a system Google Chrome is installed. Leave empty to
   # use the Playwright-managed Chromium binary.
   browser_channel: "chrome"
@@ -233,10 +249,18 @@ browser_search:
   # Leave empty to detect the current browser version automatically.
   user_agent: ""
   navigation_timeout: 30
-  selector_timeout: 12
-  # Delay before retrying a recognized challenge on the same route (0-10s).
+  selector_timeout: 3
+  # Maximum time spent looking for a consent button when it is not cached.
+  consent_timeout: 800
+  # Delay before recreating a challenged route Context (0-10s).
   challenge_retry_delay: 2
-  # Total browser page attempts for one search, including same-route retries.
+  # Context recreations after a challenge, kept separate from route attempts.
+  recovery_retries_per_route: 1
+  # Direct route plus at most this many proxy routes.
+  max_route_attempts: 3
+  # Cool down a challenged route before a later queued search (0-10s).
+  route_cooldown_seconds: 10
+  # Legacy alias for max_route_attempts.
   max_attempts: 3
   proxy_pool:
     enabled: false

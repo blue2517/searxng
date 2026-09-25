@@ -33,6 +33,7 @@ SettingsType: t.TypeAlias = dict[str, JSONType]
 searx_dir = os.path.abspath(os.path.dirname(__file__))
 
 SETTINGS_YAML = Path("settings.yml")
+RUNTIME_SETTINGS_ENV = "SEARXNG_RUNTIME_SETTINGS_PATH"
 DEFAULT_SETTINGS_FILE = Path(searx_dir) / SETTINGS_YAML
 """The :origin:`searx/settings.yml` file with all the default settings."""
 
@@ -199,29 +200,34 @@ def load_settings(load_user_settings: bool = True) -> tuple[SettingsType, str]:
     cfg = load_yaml(DEFAULT_SETTINGS_FILE)
     cfg_folder = get_user_cfg_folder()
 
-    if not load_user_settings or not cfg_folder:
+    if not load_user_settings:
         return cfg, msg
 
-    settings_yml = os.environ.get("SEARXNG_SETTINGS_PATH")
-    if settings_yml and Path(settings_yml).is_file():
-        # see get_user_cfg_folder() --> SEARXNG_SETTINGS_PATH points to a file
-        settings_yml = Path(settings_yml).name
-    else:
-        # see get_user_cfg_folder() --> SEARXNG_SETTINGS_PATH points to a folder
-        settings_yml = SETTINGS_YAML
+    if cfg_folder:
+        settings_yml = os.environ.get("SEARXNG_SETTINGS_PATH")
+        if settings_yml and Path(settings_yml).is_file():
+            # see get_user_cfg_folder() --> SEARXNG_SETTINGS_PATH points to a file
+            settings_yml = Path(settings_yml).name
+        else:
+            # see get_user_cfg_folder() --> SEARXNG_SETTINGS_PATH points to a folder
+            settings_yml = SETTINGS_YAML
 
-    cfg_file = cfg_folder / settings_yml
-    if not cfg_file.exists():
-        return cfg, msg
+        cfg_file = cfg_folder / settings_yml
+        if cfg_file.exists():
+            msg = f"load the user settings from {cfg_file}"
+            user_cfg = load_yaml(cfg_file)
 
-    msg = f"load the user settings from {cfg_file}"
-    user_cfg = load_yaml(cfg_file)
+            if is_use_default_settings(user_cfg):
+                # the user settings are merged with the default configuration
+                msg = f"merge the default settings ( {DEFAULT_SETTINGS_FILE} ) and the user settings ( {cfg_file} )"
+                update_settings(cfg, user_cfg)
+            else:
+                cfg = user_cfg
 
-    if is_use_default_settings(user_cfg):
-        # the user settings are merged with the default configuration
-        msg = f"merge the default settings ( {DEFAULT_SETTINGS_FILE} ) and the user settings ( {cfg_file} )"
-        update_settings(cfg, user_cfg)
-    else:
-        cfg = user_cfg
+    runtime_path = os.environ.get(RUNTIME_SETTINGS_ENV)
+    if runtime_path and Path(runtime_path).is_file():
+        runtime_cfg = load_yaml(runtime_path)
+        update_settings(cfg, runtime_cfg)
+        msg = f"{msg}; merge runtime settings from {runtime_path}"
 
     return cfg, msg

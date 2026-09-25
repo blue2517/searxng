@@ -224,6 +224,51 @@ table {
   }
 }
 
+.server-preferences {
+  margin-top: 2rem;
+  padding-top: 1rem;
+  border-top: 1px solid var(--color-settings-tr-hover);
+
+  fieldset {
+    margin: 1rem 0;
+    padding: 0.75rem;
+    border: 1px solid var(--color-settings-tr-hover);
+  }
+
+  legend {
+    padding: 0 0.5rem;
+    font-weight: bold;
+  }
+
+  .server-engine-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(14rem, 1fr));
+    gap: 0.5rem 1rem;
+  }
+
+  .server-setting-row,
+  .server-setting-block {
+    display: block;
+    margin: 0.6rem 0;
+  }
+
+  textarea {
+    display: block;
+    width: min(100%, 48rem);
+    margin-top: 0.35rem;
+    padding: 0.4rem;
+    font-family: monospace;
+    color: var(--color-toolkit-input-text-font);
+    background: var(--color-toolkit-select-background);
+    border: none;
+    .rounded-corners-tiny;
+  }
+
+  select {
+    margin-left: 0.5rem;
+  }
+}
+
 @media screen and (max-width: @tablet) {
   .preferences_back {
     clear: both;

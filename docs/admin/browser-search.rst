@@ -33,7 +33,12 @@ Enable the worker and the engine in the instance settings::
     endpoint: "http://127.0.0.1:8890"
     profile_dir: "/var/lib/searxng/browser-profiles"
     browser_channel: "chrome"
+    max_concurrent_pages: 2
+    google_max_concurrent_pages: 1
     challenge_retry_delay: 2
+    recovery_retries_per_route: 1
+    max_route_attempts: 3
+    route_cooldown_seconds: 10
     max_attempts: 3
     proxy_pool:
       enabled: false
@@ -46,16 +51,21 @@ Enable the worker and the engine in the instance settings::
       disabled: false
       timeout: 135.0
 
-Proxy entries accept ``socks5://``, ``http://`` and ``https://`` URLs.  Each
-proxy gets a separate persistent browser profile.  A search starts direct,
-clears the current route's cookies after a recognized Google challenge or rate
-limit.  A first challenge is retried on the same route after
-``challenge_retry_delay`` seconds (bounded to 10 seconds); only a repeated
-challenge causes cookie cleanup and route rotation.  Rate limits and HTTP
-access denials rotate without clearing cookies.  Transient route connection
-errors also rotate without clearing cookies.  The worker advances through the
-proxy pool until it succeeds, reaches ``max_attempts``, or completes one proxy
-round.
+Proxy entries accept ``socks5://``, ``http://`` and ``https://`` URLs.  The
+worker launches one Chromium instance for its lifetime.  Each engine and proxy
+route receives its own replaceable BrowserContext inside that one instance.
+Google requests are serialized by ``google_max_concurrent_pages``; later
+requests wait at the browser-search stage and do not rerun upstream query
+generation.
+
+A search starts direct.  On a recognized challenge, rate limit, or route
+failure, the current Page and Context are discarded without overwriting the
+last successful storage state.  After ``challenge_retry_delay`` seconds, the
+  same route is recreated from that last-good state and retried once according to
+  ``recovery_retries_per_route``.  A failed recovery leaves a clean Context for
+the next queued request, applies a route cooldown bounded to 10 seconds, and
+allows the search to rotate through up to ``max_route_attempts`` routes.  A
+challenge Context is never reused, and failed Context state is never saved.
 
 Authenticated SOCKS5 URLs are supported through an in-process loopback bridge,
 because Chromium does not accept SOCKS5 credentials directly.  The upstream
@@ -66,11 +76,19 @@ falls back to Playwright Chromium when Chrome is not installed.  The worker
 detects the active browser version when ``user_agent`` is empty.  In headless
 mode it removes only the ``HeadlessChrome`` label while retaining that detected
 version, keeping it aligned with the browser's client hints.  Each route context
-starts with the locale requested by SearXNG.  Successful route contexts and
-cookies are reused.  They are cleared only after a recognized challenge or rate
-limit.  Keeping each route's profile directory between worker restarts is
-important: an established profile is substantially less likely to receive an
-immediate Google challenge than a new profile.
+ starts with the locale requested by SearXNG.  Only successful contexts update
+the route's ``storage-state.json`` atomically.  Keeping each route's state file
+between worker restarts preserves the normal Google identity without carrying a
+challenged Context forward.
+
+Every browser host and child Context also receives the same page-level identity
+initialization before navigation.  This keeps ``navigator.webdriver``, plugins,
+languages, and the Chrome runtime consistent with the selected Chrome channel;
+the initialization is not a challenge solver.
+
+``max_concurrent_pages`` controls the total number of active search pages, and
+``google_max_concurrent_pages`` controls the Google lane specifically.  Extra
+requests wait in the worker's async queue and do not start another browser.
 
 The worker never logs proxy credentials or browser cookies.  Keep the worker
 bound to a private address and protect the profile directory with filesystem

@@ -11,7 +11,10 @@ from collections.abc import Generator
 import atexit
 import asyncio
 import ipaddress
+import re
+import threading
 from itertools import cycle
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -57,6 +60,11 @@ class Network:
         'max_redirects',
         'retries',
         'retry_on_http_error',
+        'proxy_pool_enabled',
+        'proxy_pool_entries',
+        'proxy_pool_max_attempts',
+        '_proxy_pool_cursor',
+        '_proxy_pool_lock',
         '_local_addresses_cycle',
         '_proxies_cycle',
         '_clients',
@@ -79,6 +87,7 @@ class Network:
         local_addresses: str | list[str] | None = None,
         retries: int = 0,
         retry_on_http_error: bool = False,
+        proxy_pool: dict[str, t.Any] | None = None,
         max_redirects: int = 30,
         logger_name: str = None,  # pyright: ignore[reportArgumentType]
     ):
@@ -94,12 +103,70 @@ class Network:
         self.local_addresses = local_addresses
         self.retries = retries
         self.retry_on_http_error = retry_on_http_error
+        proxy_pool = proxy_pool or {}
+        self.proxy_pool_entries = tuple(self._valid_proxy_entries(proxy_pool.get('entries', [])))
+        self.proxy_pool_enabled = bool(proxy_pool.get('enabled', False)) and bool(self.proxy_pool_entries)
+        try:
+            configured_attempts = int(proxy_pool.get('max_attempts', 3))
+        except (TypeError, ValueError):
+            configured_attempts = 3
+        self.proxy_pool_max_attempts = min(3, max(1, configured_attempts))
+        self._proxy_pool_cursor = 0
+        self._proxy_pool_lock = threading.Lock()
         self.max_redirects = max_redirects
         self._local_addresses_cycle = self.get_ipaddress_cycle()
         self._proxies_cycle = self.get_proxy_cycles()
         self._clients = {}
         self._logger = logger.getChild(logger_name) if logger_name else logger
         self.check_parameters()
+
+    @staticmethod
+    def _valid_proxy_entries(values: t.Any) -> list[str]:
+        entries: list[str] = []
+        for value in values or []:
+            candidate = str(value).strip()
+            if not candidate:
+                continue
+            try:
+                parsed = urlsplit(candidate)
+                if parsed.scheme.lower() not in {'http', 'https', 'socks4', 'socks5', 'socks5h'}:
+                    continue
+                if not parsed.hostname or not parsed.port:
+                    continue
+            except ValueError:
+                continue
+            entries.append(candidate)
+        return list(dict.fromkeys(entries))
+
+    def _proxy_pool_round(self) -> list[str]:
+        if not self.proxy_pool_enabled:
+            return []
+        with self._proxy_pool_lock:
+            start = self._proxy_pool_cursor % len(self.proxy_pool_entries)
+            ordered = list(self.proxy_pool_entries[start:]) + list(self.proxy_pool_entries[:start])
+            self._proxy_pool_cursor = (start + 1) % len(self.proxy_pool_entries)
+        return ordered[: max(0, self.proxy_pool_max_attempts - 1)]
+
+    @staticmethod
+    def _looks_like_challenge(response: httpx.Response) -> bool:
+        if response.status_code in {403, 429, 503}:
+            return True
+        location = response.headers.get('location', '').lower()
+        if any(token in location for token in ('captcha', 'challenge', 'sorry', 'verify')):
+            return True
+        content_type = response.headers.get('content-type', '').lower()
+        if 'html' not in content_type:
+            return False
+        try:
+            sample = response.text[: 64 * 1024].lower()
+        except Exception:  # pragma: no cover - malformed response body
+            return False
+        return bool(
+            re.search(
+                r'(?:<title[^>]*>[^<]*(?:captcha|challenge)|(?:action|id|class)=["\'][^"\']*(?:captcha|challenge|sorry)|verify\s+(?:you\s+are\s+)?human|unusual\s+traffic|robot\s+check|are\s+you\s+a\s+robot|cf-chl)',
+                sample,
+            )
+        )
 
     def check_parameters(self):
         for address in self.iter_ipaddresses():
@@ -187,11 +254,18 @@ class Network:
         Network._TOR_CHECK_RESULT[proxies] = result
         return result
 
-    async def get_client(self, verify: bool | None = None, max_redirects: int | None = None) -> httpx.AsyncClient:
+    async def get_client(
+        self,
+        verify: bool | None = None,
+        max_redirects: int | None = None,
+        proxy_override: str | None = None,
+    ) -> httpx.AsyncClient:
         verify = self.verify if verify is None else verify
         max_redirects = self.max_redirects if max_redirects is None else max_redirects
         local_address = next(self._local_addresses_cycle)
         proxies = next(self._proxies_cycle)  # is a tuple so it can be part of the key
+        if proxy_override:
+            proxies = (('all://', proxy_override),)
         key = (verify, max_redirects, local_address, proxies)
         hook_log_response = self.log_response if sxng_debug else None
         if key not in self._clients or self._clients[key].is_closed:
@@ -269,13 +343,39 @@ class Network:
             return False
         return True
 
+    @staticmethod
+    def _is_loopback_url(url: str) -> bool:
+        try:
+            parsed = urlsplit(url)
+            host = (parsed.hostname or "").strip().lower()
+            if not host:
+                return False
+            if host in {"127.0.0.1", "localhost", "::1", "0.0.0.0", "testserver"}:
+                return True
+            try:
+                ip = ipaddress.ip_address(host)
+                return ip.is_loopback or ip.is_unspecified
+            except ValueError:
+                return False
+        except Exception:
+            return False
+
     async def call_client(self, stream: bool, method: str, url: str, **kwargs: t.Any) -> SXNG_Response:
         retries = self.retries
         was_disconnected = False
         do_raise_for_httperror = Network.extract_do_raise_for_httperror(kwargs)
         kwargs_clients = Network.extract_kwargs_clients(kwargs)
+        is_loopback = self._is_loopback_url(url)
+        if is_loopback or not self.proxy_pool_enabled:
+            proxy_attempts = [None]
+        else:
+            fallback_proxies = self._proxy_pool_round()
+            proxy_attempts = [None, *fallback_proxies]
+            proxy_attempts = proxy_attempts[: self.proxy_pool_max_attempts]
+        proxy_index = 0
         while retries >= 0:  # pragma: no cover
-            client = await self.get_client(**kwargs_clients)
+            proxy_override = proxy_attempts[proxy_index]
+            client = await self.get_client(proxy_override=proxy_override, **kwargs_clients)
             cookies = kwargs.pop("cookies", None)
             client.cookies = httpx.Cookies(cookies)
             try:
@@ -283,6 +383,17 @@ class Network:
                     return client.stream(method, url, **kwargs)
 
                 response = await client.request(method, url, **kwargs)
+                if self._looks_like_challenge(response) and proxy_index + 1 < len(proxy_attempts):
+                    self._logger.warning(
+                        'HTTP challenge from %s, rotating proxy (%s/%s)',
+                        response.url.host,
+                        proxy_index + 1,
+                        len(proxy_attempts) - 1,
+                    )
+                    await response.aclose()
+                    proxy_index += 1
+                    retries = self.retries
+                    continue
                 if self.is_valid_response(response) or retries <= 0:
                     return self.patch_response(response, do_raise_for_httperror)
             except httpx.RemoteProtocolError as e:
@@ -294,9 +405,17 @@ class Network:
                     self._logger.warning('httpx.RemoteProtocolError: the server has disconnected, retrying')
                     continue
                 if retries <= 0:
+                    if proxy_index + 1 < len(proxy_attempts):
+                        proxy_index += 1
+                        retries = self.retries
+                        continue
                     raise e
             except (httpx.RequestError, httpx.HTTPStatusError) as e:
                 if retries <= 0:
+                    if proxy_index + 1 < len(proxy_attempts):
+                        proxy_index += 1
+                        retries = self.retries
+                        continue
                     raise e
             retries -= 1
 
@@ -357,6 +476,7 @@ def initialize(
         'keepalive_expiry': settings_outgoing['keepalive_expiry'],
         'local_addresses': settings_outgoing['source_ips'],
         'using_tor_proxy': settings_outgoing['using_tor_proxy'],
+        'proxy_pool': settings_outgoing.get('proxy_pool', {}),
         'proxies': settings_outgoing['proxies'],
         'max_redirects': settings_outgoing['max_redirects'],
         'retries': settings_outgoing['retries'],

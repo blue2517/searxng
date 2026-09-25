@@ -86,11 +86,13 @@ def response(resp: "SXNG_Response") -> EngineResults:
         title = str(item.get("title", "")).strip()
         if not url or not title:
             continue
-        results.append(
-            {
-                "url": url,
-                "title": title,
-                "content": str(item.get("content", "")).strip(),
-            }
-        )
+        res_item = {
+            "url": url,
+            "title": title,
+            "content": str(item.get("content", "")).strip(),
+        }
+        domain = str(item.get("domain", "")).strip()
+        if domain:
+            res_item["domain"] = domain
+        results.append(res_item)
     return results
