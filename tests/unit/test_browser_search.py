@@ -87,6 +87,8 @@ class BrowserManagerTests(IsolatedAsyncioTestCase):
         self.assertIn(
             "q=%E5%8D%A1%E8%8E%B2+%E5%A5%A5%E5%B0%94%E9%BB%9B%E8%A5%BF%E4%BA%9A", url
         )
+        self.assertIn("gl=us", url)
+        self.assertIn("hl=zh-CN", url)
         self.assertIn("start=10", url)
         self.assertIn("safe=active", url)
         self.assertIn("tbs=qdr%3Aw", url)
@@ -115,7 +117,8 @@ class BrowserManagerTests(IsolatedAsyncioTestCase):
         self.assertEqual(
             "zh-Hant-TW", BrowserSearchManager._normalize_locale("zh-hant-tw")
         )
-        self.assertEqual("en-US", BrowserSearchManager._normalize_locale("all"))
+        self.assertEqual("", BrowserSearchManager._normalize_locale("all"))
+        self.assertEqual("en-US", BrowserSearchManager._normalize_locale("all", default="en-US"))
 
     def test_context_key_reuses_direct_context_across_locales(self):
         manager = BrowserSearchManager({})

@@ -49,7 +49,7 @@ def request(query: str, params: "OnlineParams") -> None:
         "engine": "google",
         "query": query,
         "pageno": params["pageno"],
-        "locale": params.get("searxng_locale", "en-US"),
+        "locale": params.get("searxng_locale", "auto"),
         "safesearch": params["safesearch"],
         "time_range": params["time_range"],
     }

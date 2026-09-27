@@ -397,17 +397,17 @@ class BrowserSearchManager:
         self._socks_bridges.clear()
 
     @staticmethod
-    def _normalize_locale(value: str | None) -> str:
+    def _normalize_locale(value: str | None, default: str = "") -> str:
         locale = str(value or "").strip().replace("_", "-")
         if not locale or locale.lower() in {"all", "auto"}:
-            return "en-US"
+            return default
         parts = locale.split("-")
         if not parts[0].isalpha() or len(parts[0]) not in {2, 3}:
-            return "en-US"
+            return default
         normalized = [parts[0].lower()]
         for part in parts[1:]:
             if not part.isalnum() or not 2 <= len(part) <= 8:
-                return "en-US"
+                return default
             if len(part) == 2 and part.isalpha():
                 normalized.append(part.upper())
             elif len(part) == 4 and part.isalpha():
@@ -457,7 +457,7 @@ class BrowserSearchManager:
     async def _create_context(self, route: Route, locale: str, key: str) -> Any:
         if self._browser is None:
             raise RuntimeError("browser search is not started")
-        norm_locale = self._normalize_locale(locale)
+        norm_locale = self._normalize_locale(locale, default="zh-CN") or "zh-CN"
         kwargs: dict[str, Any] = {
             "locale": norm_locale,
             "viewport": {"width": 1280, "height": 800},
@@ -601,12 +601,15 @@ class BrowserSearchManager:
         ):
             return
         try:
+            accept_language = self._normalize_locale(locale)
+            if not accept_language:
+                accept_language = "zh-CN,zh;q=0.9,en;q=0.8"
             session = await context.new_cdp_session(page)
             await session.send(
                 "Network.setUserAgentOverride",
                 {
                     "userAgent": self._resolved_user_agent,
-                    "acceptLanguage": self._normalize_locale(locale),
+                    "acceptLanguage": accept_language,
                 },
             )
         except Exception:
@@ -614,11 +617,13 @@ class BrowserSearchManager:
 
     @staticmethod
     def _google_url(request: SearchRequest) -> str:
-        locale = BrowserSearchManager._normalize_locale(request.locale)
         params: dict[str, str] = {
             "q": request.query,
-            "hl": locale,
+            "gl": "us",
         }
+        locale = BrowserSearchManager._normalize_locale(request.locale)
+        if locale:
+            params["hl"] = locale
         if request.pageno > 1:
             params["start"] = str((request.pageno - 1) * 10)
         if request.safesearch:
@@ -632,7 +637,7 @@ class BrowserSearchManager:
         locale = BrowserSearchManager._normalize_locale(request.locale)
         params: dict[str, str] = {
             "q": request.query,
-            "kl": locale.lower(),
+            "kl": locale.lower() if locale else "us-en",
             "kp": {0: "-2", 1: "-1", 2: "1"}.get(request.safesearch, "-2"),
         }
         if request.pageno > 1:
