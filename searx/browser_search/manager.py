@@ -14,6 +14,16 @@ import time
 from typing import Any
 from urllib.parse import urlencode
 
+from .auth_state import (
+    extract_google_storage_state,
+    get_google_auth_status,
+    has_google_auth_cookies,
+    load_google_auth_state,
+    merge_storage_states,
+    resolve_google_auth_path,
+    save_google_auth_state,
+    update_google_auth_meta,
+)
 from .proxy_pool import ProxyEndpoint, ProxyPool
 from .socks_bridge import Socks5AuthBridge
 
@@ -160,6 +170,8 @@ class BrowserSearchManager:
         self.profile_root = Path(
             config.get("profile_dir", "/var/lib/searxng/browser-profiles")
         )
+        self.google_auth_state_path = resolve_google_auth_path(config)
+        self.persist_google_auth = bool(config.get("persist_google_auth", True))
         self.headless = bool(config.get("headless", True))
         self.browser_channel = (
             str(config.get("browser_channel", "chrome")).strip() or None
@@ -467,8 +479,21 @@ class BrowserSearchManager:
             kwargs["proxy"] = self._proxy_config(route.proxy)
         state_path = self._state_path(key)
         force_clean = key in self._force_clean_context
+        is_google = key.startswith("google")
+        auth_state = (
+            load_google_auth_state(self.google_auth_state_path) if is_google else None
+        )
+        route_state: dict[str, Any] | None = None
         if state_path.exists() and not force_clean:
-            kwargs["storage_state"] = str(state_path)
+            if auth_state is not None:
+                try:
+                    loaded = json.loads(state_path.read_text(encoding="utf-8"))
+                    if isinstance(loaded, dict):
+                        route_state = loaded
+                except Exception:
+                    route_state = None
+            else:
+                kwargs["storage_state"] = str(state_path)
         elif (
             route.profile_key == "direct"
             and self._direct_context is not None
@@ -480,15 +505,22 @@ class BrowserSearchManager:
             try:
                 await self._direct_context.storage_state(path=str(state_path))
                 if state_path.exists():
-                    kwargs["storage_state"] = str(state_path)
+                    if auth_state is not None:
+                        loaded = json.loads(state_path.read_text(encoding="utf-8"))
+                        if isinstance(loaded, dict):
+                            route_state = loaded
+                    else:
+                        kwargs["storage_state"] = str(state_path)
             except Exception:
                 logger.debug("failed to seed direct storage state", exc_info=True)
+        if auth_state is not None:
+            kwargs["storage_state"] = merge_storage_states(route_state, auth_state)
         context = await self._browser.new_context(**kwargs)
         try:
             await context.add_init_script(BROWSER_STEALTH_SCRIPT)
         except Exception:
             logger.debug("failed to install browser stealth script", exc_info=True)
-        if not state_path.exists() and not force_clean:
+        if not state_path.exists() and not force_clean and auth_state is None:
             try:
                 page = await context.new_page()
                 seed_url = (
@@ -502,6 +534,8 @@ class BrowserSearchManager:
                 await self._save_state(key, context)
             except Exception:
                 pass
+        elif auth_state is not None and not state_path.exists():
+            await self._save_state(key, context)
         if force_clean:
             self._force_clean_context.discard(key)
         self._context_locales[key] = norm_locale
@@ -534,6 +568,87 @@ class BrowserSearchManager:
                 logger.info("browser-search-state-saved context=%s", key)
             except Exception:
                 logger.debug("failed to save browser state for %s", key, exc_info=True)
+
+    async def _inspect_google_auth(
+        self, page: Any, context: Any, results: list[dict[str, str]]
+    ) -> tuple[bool | None, str]:
+        has_login_link = False
+        has_account_ui = False
+        try:
+            ui = await page.evaluate(
+                """
+                () => ({
+                  hasLoginLink: Boolean(
+                    document.querySelector('a[href*="accounts.google.com/ServiceLogin"]')
+                  ),
+                  hasAccountUi: Boolean(
+                    document.querySelector(
+                      'a[href*="SignOutOptions"], a[aria-label*="Google"], a[aria-label*="谷歌账号"], [data-ogsr-up]'
+                    )
+                  ),
+                })
+                """
+            )
+            if isinstance(ui, dict):
+                has_login_link = bool(ui.get("hasLoginLink"))
+                has_account_ui = bool(ui.get("hasAccountUi"))
+        except Exception:
+            pass
+
+        has_auth_cookie = False
+        try:
+            cookies = await context.cookies(["https://www.google.com"])
+            has_auth_cookie = has_google_auth_cookies(cookies)
+        except Exception:
+            pass
+
+        all_goto = bool(results) and all(
+            "google.com/goto" in str(item.get("url", "")) for item in results
+        )
+        if has_login_link and not has_account_ui:
+            return False, "session_logged_out"
+        if has_account_ui:
+            return True, "authenticated"
+        if has_auth_cookie:
+            if results and not all_goto:
+                return True, "authenticated_direct_urls"
+            if all_goto:
+                return False, "redirect_urls_only"
+        return None, "unknown"
+
+    async def _update_google_auth_after_search(
+        self, page: Any, context: Any, results: list[dict[str, str]]
+    ) -> None:
+        if not self.google_auth_state_path.exists():
+            return
+        auth_ok, reason = await self._inspect_google_auth(page, context, results)
+        if auth_ok is True:
+            if self.persist_google_auth:
+                try:
+                    raw_state = await context.storage_state()
+                    if isinstance(raw_state, dict):
+                        google_state = extract_google_storage_state(raw_state)
+                        if has_google_auth_cookies(google_state.get("cookies")):
+                            save_google_auth_state(
+                                self.google_auth_state_path,
+                                google_state,
+                                source_format="refresh",
+                                last_auth_ok=True,
+                                last_reason=reason,
+                            )
+                            return
+                except Exception:
+                    logger.debug(
+                        "failed to refresh google auth state", exc_info=True
+                    )
+            update_google_auth_meta(
+                self.google_auth_state_path, last_auth_ok=True, last_reason=reason
+            )
+        elif auth_ok is False:
+            update_google_auth_meta(
+                self.google_auth_state_path, last_auth_ok=False, last_reason=reason
+            )
+            logger.warning("google-auth-session-expired reason=%s", reason)
 
     async def _close_route(
         self,
@@ -1078,6 +1193,8 @@ class BrowserSearchManager:
                         "route": route.name,
                     }
             await self._save_state(key, context)
+            if engine == "google":
+                await self._update_google_auth_after_search(page, context, results)
             return {"ok": True, "status": "ok", "route": route.name, "results": results}
         except Exception as exc:
             try:
@@ -1327,6 +1444,47 @@ class BrowserSearchManager:
             "browser-search warmup locale=%s contexts=%s", locale, len(self._contexts)
         )
 
+    async def reload_google_auth(
+        self, *, clear_route_states: bool = False
+    ) -> dict[str, Any]:
+        """Discard cached Google contexts so newly imported/cleared auth takes effect."""
+
+        if self._context_lock is not None:
+            async with self._context_lock:
+                google_keys = [
+                    key for key in list(self._contexts) if key.startswith("google")
+                ]
+                for key in google_keys:
+                    context = self._contexts.get(key)
+                    active = self._context_active_pages.get(key, 0)
+                    if active:
+                        self._pending_context_close.add(key)
+                        continue
+                    self._contexts.pop(key, None)
+                    self._context_locales.pop(key, None)
+                    self._context_active_pages.pop(key, None)
+                    if context is not None:
+                        try:
+                            await context.close()
+                        except Exception:
+                            logger.debug(
+                                "failed to close google context %s", key, exc_info=True
+                            )
+                for key in [k for k in list(self._route_cooldowns) if k.startswith("google")]:
+                    self._route_cooldowns.pop(key, None)
+                for key in [
+                    k for k in list(self._force_clean_context) if k.startswith("google")
+                ]:
+                    self._force_clean_context.discard(key)
+        if clear_route_states:
+            for candidate in self.profile_root.glob("google-*"):
+                state_file = candidate / "storage-state.json"
+                try:
+                    state_file.unlink(missing_ok=True)
+                except OSError:
+                    pass
+        return get_google_auth_status(self.google_auth_state_path)
+
 
 class BrowserSearchDispatcher:
     """Thread-safe SearXNG facade backed by one async Chromium runtime."""
@@ -1476,6 +1634,20 @@ class BrowserSearchDispatcher:
             self._startup_error = None
         future = asyncio.run_coroutine_threadsafe(self._search(request), self._loop)
         return future.result()
+
+    def reload_google_auth(self, *, clear_route_states: bool = False) -> dict[str, Any]:
+        if not self._ready.wait(timeout=60):
+            raise RuntimeError("browser search runtime is not ready")
+        if self._manager is None:
+            raise RuntimeError("browser search runtime is not initialized")
+        future = asyncio.run_coroutine_threadsafe(
+            self._manager.reload_google_auth(clear_route_states=clear_route_states),
+            self._loop,
+        )
+        return future.result(timeout=30)
+
+    def google_auth_status(self) -> dict[str, Any]:
+        return get_google_auth_status(resolve_google_auth_path(self.config))
 
     def close(self) -> None:
         if not self._thread.is_alive():

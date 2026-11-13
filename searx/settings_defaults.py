@@ -277,6 +277,8 @@ SCHEMA: dict[str, t.Any] = {
         'port': SettingsValue((int, str), 8890),
         'endpoint': SettingsValue(str, 'http://127.0.0.1:8890'),
         'profile_dir': SettingsValue(str, '/var/lib/searxng/browser-profiles'),
+        'google_auth_state_file': SettingsValue(str, ''),
+        'persist_google_auth': SettingsValue(bool, True),
         'headless': SettingsValue(bool, True),
         'prewarm': SettingsValue(bool, True),
         'prewarm_locale': SettingsValue(str, 'zh-CN'),

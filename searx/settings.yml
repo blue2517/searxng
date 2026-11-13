@@ -232,6 +232,8 @@ browser_search:
   port: 8890
   endpoint: "http://127.0.0.1:8890"
   profile_dir: "/var/lib/searxng/browser-profiles"
+  google_auth_state_file: ""
+  persist_google_auth: true
   headless: true
   # Keep browser contexts warm so the first search does not pay Chrome startup cost.
   prewarm: true

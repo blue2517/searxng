@@ -1011,6 +1011,9 @@ def preferences():
         doi_resolvers = get_setting("doi_resolvers", {}),
         server_config = server_config.snapshot(),
         server_saved = sxng_request.args.get('server_saved') == '1',
+        google_auth_saved = sxng_request.args.get('google_auth_saved') == '1',
+        google_auth_cleared = sxng_request.args.get('google_auth_cleared') == '1',
+        google_auth_error = sxng_request.args.get('google_auth_error', ''),
         server_admin_enabled = bool(settings['server'].get('auth_username') and settings['server'].get('auth_password')),
         # fmt: on
     )
@@ -1028,6 +1031,30 @@ def save_server_preferences():
         logger.exception("failed to save server preferences")
         return Response(f"Server settings could not be saved: {escape(str(exc))}", status=400, mimetype='text/plain')
     return redirect(url_for('preferences', server_saved='1'))
+
+
+@app.route('/preferences/server/google-auth', methods=['POST'])
+def save_server_google_auth():
+    """Import or clear persisted Google search cookies for the browser worker."""
+
+    if not settings['server'].get('auth_username') or not settings['server'].get('auth_password'):
+        return Response('Server settings require HTTP Basic Auth', status=403, mimetype='text/plain')
+    action = str(sxng_request.form.get('action', 'import')).strip().lower()
+    if action == 'clear':
+        try:
+            server_config.clear_google_auth()
+        except (OSError, RuntimeError, ValueError) as exc:
+            logger.exception("failed to clear Google auth state")
+            return redirect(url_for('preferences', google_auth_error=str(exc)))
+        return redirect(url_for('preferences', google_auth_cleared='1'))
+
+    raw_cookies = str(sxng_request.form.get('google_auth_cookies', ''))
+    try:
+        server_config.import_google_auth(raw_cookies)
+    except (OSError, RuntimeError, ValueError) as exc:
+        logger.warning("failed to import Google auth cookies: %s", exc)
+        return redirect(url_for('preferences', google_auth_error=str(exc)))
+    return redirect(url_for('preferences', google_auth_saved='1'))
 
 
 app.add_url_rule('/favicon_proxy', methods=['GET'], endpoint="favicon_proxy", view_func=favicons.favicon_proxy)

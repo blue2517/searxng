@@ -305,6 +305,50 @@
 
       <input type="submit" value="保存服务器配置">
     </form>
+
+    <form method="post" action="{{ url_for('save_server_google_auth') }}" autocomplete="off">
+      <fieldset>
+        <legend>Google 浏览器搜索登录态</legend>
+        {% if google_auth_saved %}
+          <p class="dialog-success-block">Google 登录态已导入并通知浏览器搜索服务生效。</p>
+        {% endif %}
+        {% if google_auth_cleared %}
+          <p class="dialog-success-block">Google 登录态已清除。</p>
+        {% endif %}
+        {% if google_auth_error %}
+          <p class="dialog-error-block">Google 登录态更新失败：{{ google_auth_error }}</p>
+        {% endif %}
+        <p class="server-setting-row">
+          当前状态：
+          {% if server_config.google_auth.configured %}
+            <strong>已导入（{{ server_config.google_auth.cookie_count }} 个 Cookie）</strong>
+            {% if server_config.google_auth.last_auth_ok is sameas true %}
+              — 最近一次搜索校验：<strong>已登录</strong>
+            {% elif server_config.google_auth.last_auth_ok is sameas false %}
+              — 最近一次搜索校验：<strong>登录态可能已失效（{{ server_config.google_auth.last_reason }}）</strong>
+            {% else %}
+              — 尚未执行搜索校验
+            {% endif %}
+            {% if server_config.google_auth.updated_at %}
+              （更新于 {{ server_config.google_auth.updated_at }}）
+            {% endif %}
+          {% else %}
+            <strong>未导入（当前为匿名搜索）</strong>
+          {% endif %}
+        </p>
+        <label class="server-setting-block">
+          导入 Google Cookies
+          <textarea name="google_auth_cookies" rows="5" spellcheck="false" placeholder="支持直接粘贴 HTTP Cookie: 请求头字符串、Cookie-Editor JSON、Netscape cookies.txt 或 Playwright storage_state.json（不回显已保存内容）"></textarea>
+        </label>
+        <p class="description">建议使用专用 Google 小号在无痕窗口登录后导出完整 Cookie 并关闭窗口（不要点退出登录）。</p>
+        <p class="server-setting-row">
+          <button type="submit" name="action" value="import">导入 / 更新 Google 登录态</button>
+          {% if server_config.google_auth.configured %}
+            <button type="submit" name="action" value="clear">清除 Google 登录态</button>
+          {% endif %}
+        </p>
+      </fieldset>
+    </form>
   </section>
   {% endif %}
 {%- endblock -%}

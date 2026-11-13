@@ -11,6 +11,13 @@ import threading
 from typing import Any
 from socketserver import ThreadingMixIn
 
+from .auth_state import (
+    clear_google_auth_state,
+    get_google_auth_status,
+    parse_google_cookies_input,
+    resolve_google_auth_path,
+    save_google_auth_state,
+)
 from .manager import BrowserSearchDispatcher, SearchRequest
 
 logger = logging.getLogger(__name__)
@@ -58,9 +65,55 @@ class BrowserSearchHandler(BaseHTTPRequestHandler):
         if self.path == "/health":
             self._send(200, {"ok": True, "service": "browser-search"})
             return
+        if self.path == "/v1/auth/google":
+            auth_path = resolve_google_auth_path(self.server.manager.config)
+            self._send(200, {"ok": True, **get_google_auth_status(auth_path)})
+            return
         self._send(404, {"ok": False, "error": "not_found"})
 
     def do_POST(self) -> None:  # noqa: N802
+        if self.path == "/v1/auth/google":
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                if length <= 0 or length > 512 * 1024:
+                    raise ValueError("invalid request body size")
+                payload = json.loads(self.rfile.read(length))
+                if not isinstance(payload, dict):
+                    raise ValueError("JSON body must be an object")
+                auth_path = resolve_google_auth_path(self.server.manager.config)
+                action = str(payload.get("action", "import")).strip().lower()
+                if action == "clear":
+                    clear_google_auth_state(auth_path)
+                    status = self.server.manager.reload_google_auth(
+                        clear_route_states=True
+                    )
+                    self._send(200, {"ok": True, **status})
+                    return
+                if action == "reload":
+                    status = self.server.manager.reload_google_auth(
+                        clear_route_states=bool(payload.get("clear_route_states", False))
+                    )
+                    self._send(200, {"ok": True, **status})
+                    return
+                raw = str(payload.get("raw", ""))
+                state, source_format = parse_google_cookies_input(
+                    raw, require_auth_cookies=True
+                )
+                save_google_auth_state(auth_path, state, source_format=source_format)
+                status = self.server.manager.reload_google_auth(
+                    clear_route_states=False
+                )
+                self._send(200, {"ok": True, **status})
+                return
+            except (ValueError, TypeError, json.JSONDecodeError) as exc:
+                self._send(
+                    400, {"ok": False, "status": "invalid_request", "reason": str(exc)}
+                )
+                return
+            except Exception as exc:  # pragma: no cover - service boundary
+                logger.exception("google auth update failed")
+                self._send(500, {"ok": False, "status": "error", "reason": str(exc)})
+                return
         if self.path != "/v1/search":
             self._send(404, {"ok": False, "error": "not_found"})
             return
