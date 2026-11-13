@@ -619,7 +619,7 @@ class BrowserSearchManager:
     def _google_url(request: SearchRequest) -> str:
         params: dict[str, str] = {
             "q": request.query,
-            "gl": "us",
+            "gl": "hk",
         }
         locale = BrowserSearchManager._normalize_locale(request.locale)
         if locale:
