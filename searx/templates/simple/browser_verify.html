@@ -212,6 +212,8 @@
   let inputBusy = false;
   let lastObjectUrl = null;
   let pollTimer = null;
+  let viewportWidth = 1280;
+  let viewportHeight = 800;
 
   function setStatus(text, kind) {
     statusEl.textContent = text;
@@ -222,6 +224,10 @@
     if (!data || !data.ok) {
       setStatus('状态异常：' + ((data && data.reason) || '未知错误'), 'is-error');
       return;
+    }
+    if (data.viewport && data.viewport.width && data.viewport.height) {
+      viewportWidth = Number(data.viewport.width) || 1280;
+      viewportHeight = Number(data.viewport.height) || 800;
     }
     active = Boolean(data.active);
     const isLogin = (data.mode || MODE) === 'login';
@@ -299,9 +305,14 @@
   }
 
   async function startSession(forceNew) {
-    setStatus('正在打开服务器浏览器页面…', '');
+    setStatus(
+      MODE === 'login'
+        ? '正在临时启动独立登录浏览器（完成后自动销毁）…'
+        : '正在打开服务器浏览器页面…',
+      ''
+    );
     placeholderEl.style.display = 'flex';
-    placeholderEl.textContent = '正在打开目标页面…';
+    placeholderEl.textContent = MODE === 'login' ? '正在启动临时登录浏览器…' : '正在打开目标页面…';
     try {
       const data = await postJson(URLS.start, {
         engine: ENGINE,
@@ -335,8 +346,10 @@
     if (!active) return;
     const rect = screenEl.getBoundingClientRect();
     if (!rect.width || !rect.height) return;
-    const x = Math.round(((ev.clientX - rect.left) / rect.width) * 1280);
-    const y = Math.round(((ev.clientY - rect.top) / rect.height) * 800);
+    const targetW = screenEl.naturalWidth || viewportWidth || 1280;
+    const targetH = screenEl.naturalHeight || viewportHeight || 800;
+    const x = Math.round(((ev.clientX - rect.left) / rect.width) * targetW);
+    const y = Math.round(((ev.clientY - rect.top) / rect.height) * targetH);
     sendInput({ kind: 'click', x, y, button: 'left', click_count: 1 });
   });
 

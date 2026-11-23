@@ -177,27 +177,35 @@ class ManagerVerificationTests(IsolatedAsyncioTestCase):
             self.assertFalse(res["ok"])
             self.assertEqual("disallowed verification URL", res["reason"])
 
-    async def test_login_mode_opens_google_signin_and_persists_session(self):
+    async def test_login_mode_uses_temporary_browser_and_cleans_up(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             manager = BrowserSearchManager({"profile_dir": tmpdir})
             manager._browser = object()
             manager._start_lock = asyncio.Lock()
             manager._context_lock = asyncio.Lock()
 
-            page = AsyncMock()
-            page.url = "https://accounts.google.com/ServiceLogin?continue=https%3A%2F%2Fwww.google.com%2F&hl=zh-CN"
-            page.title = AsyncMock(return_value="Sign in - Google Accounts")
-            page.is_closed = Mock(return_value=False)
-            page.goto = AsyncMock()
-            page.mouse = AsyncMock()
-            page.keyboard = AsyncMock()
-            page.evaluate = AsyncMock(
-                return_value={"hasLoginLink": False, "hasAccountUi": True}
+            stale_search_context = AsyncMock()
+            manager._contexts["google-direct"] = stale_search_context
+            manager._context_active_pages["google-direct"] = 0
+
+            login_page = AsyncMock()
+            login_page.url = "https://accounts.google.com/ServiceLogin?continue=https%3A%2F%2Fwww.google.com%2F&hl=zh-CN"
+            login_page.title = AsyncMock(return_value="Sign in - Google Accounts")
+            login_page.is_closed = Mock(return_value=False)
+            login_page.goto = AsyncMock()
+            login_page.mouse = AsyncMock()
+            login_page.keyboard = AsyncMock()
+            login_page.evaluate = AsyncMock(
+                side_effect=[
+                    {"width": 1280, "height": 812},
+                    {"hasLoginLink": False, "hasAccountUi": True},
+                    {"hasLoginLink": False, "hasAccountUi": True},
+                ]
             )
 
-            context = AsyncMock()
-            context.new_page = AsyncMock(return_value=page)
-            context.cookies = AsyncMock(
+            temp_context = AsyncMock()
+            temp_context.pages = [login_page]
+            temp_context.cookies = AsyncMock(
                 return_value=[{"name": "SID", "value": "sid123", "domain": ".google.com"}]
             )
 
@@ -217,27 +225,119 @@ class ManagerVerificationTests(IsolatedAsyncioTestCase):
                     Path(path).write_text(json.dumps(payload), encoding="utf-8")
                 return payload
 
-            context.storage_state = AsyncMock(side_effect=write_storage_state)
-            manager._contexts["google-direct"] = context
+            temp_context.storage_state = AsyncMock(side_effect=write_storage_state)
 
-            with patch.object(
-                BrowserSearchManager,
-                "_block_reason",
-                new=AsyncMock(return_value=None),
+            temp_playwright = AsyncMock()
+            temp_playwright.chromium = AsyncMock()
+            temp_playwright.chromium.launch_persistent_context = AsyncMock(
+                return_value=temp_context
+            )
+            fake_factory = Mock()
+            fake_factory.return_value.start = AsyncMock(return_value=temp_playwright)
+            fake_xvfb = Mock()
+
+            with (
+                patch.object(
+                    BrowserSearchManager,
+                    "_start_temp_xvfb",
+                    return_value=(fake_xvfb, ":99"),
+                ),
+                patch.object(
+                    BrowserSearchManager,
+                    "_stop_temp_xvfb",
+                ) as stop_xvfb,
+                patch.object(
+                    BrowserSearchManager,
+                    "_load_login_playwright_factory",
+                    return_value=(fake_factory, "patchright"),
+                ),
+                patch.object(
+                    BrowserSearchManager,
+                    "_resolve_full_chromium_executable",
+                    return_value="/opt/chromium/chrome",
+                ),
+                patch.object(
+                    BrowserSearchManager,
+                    "_block_reason",
+                    new=AsyncMock(return_value=None),
+                ),
             ):
                 started = await manager.verify_start(engine="google", mode="login")
                 self.assertTrue(started["active"])
                 self.assertEqual("login", started["mode"])
+                self.assertTrue(started["temporary_browser"])
+                self.assertEqual({"width": 1280, "height": 812}, started["viewport"])
                 self.assertFalse(started["solved"])
-                self.assertIn("accounts.google.com/ServiceLogin", page.goto.await_args.args[0])
+                self.assertIn(
+                    "accounts.google.com/ServiceLogin",
+                    login_page.goto.await_args.args[0],
+                )
+                launch_kwargs = (
+                    temp_playwright.chromium.launch_persistent_context.await_args.kwargs
+                )
+                self.assertFalse(launch_kwargs["headless"])
+                self.assertTrue(launch_kwargs["no_viewport"])
+                self.assertEqual(["--enable-automation"], launch_kwargs["ignore_default_args"])
+                self.assertEqual(":99", launch_kwargs["env"]["DISPLAY"])
+                self.assertEqual("/opt/chromium/chrome", launch_kwargs["executable_path"])
+                self.assertNotIn("user_agent", launch_kwargs)
+                temp_context.add_init_script.assert_not_called()
 
-                page.url = "https://www.google.com/"
+                temp_dir = manager._verify_session["temp_resources"]["temp_dir"]
+                self.assertTrue(Path(temp_dir).exists())
+
+                login_page.url = "https://www.google.com/"
                 after_login = await manager.verify_status(engine="google")
                 self.assertTrue(after_login["solved"])
+                # Stale headless search context must be invalidated so next search reloads state
+                stale_search_context.close.assert_awaited_once()
+                self.assertNotIn("google-direct", manager._contexts)
+
                 login_status = manager.google_login_status()
                 self.assertIs(login_status["logged_in"], True)
                 self.assertTrue(login_status["has_auth_cookies"])
+
                 await manager.verify_close()
+                login_page.close.assert_awaited_once()
+                temp_context.close.assert_awaited_once()
+                temp_playwright.stop.assert_awaited_once()
+                stop_xvfb.assert_called_once_with(fake_xvfb)
+                self.assertFalse(Path(temp_dir).exists())
+
+    async def test_login_start_failure_cleans_up_temporary_resources(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = BrowserSearchManager({"profile_dir": tmpdir})
+            temp_playwright = AsyncMock()
+            temp_playwright.chromium = AsyncMock()
+            temp_playwright.chromium.launch_persistent_context = AsyncMock(
+                side_effect=RuntimeError("launch boom")
+            )
+            fake_factory = Mock()
+            fake_factory.return_value.start = AsyncMock(return_value=temp_playwright)
+            fake_xvfb = Mock()
+
+            with (
+                patch.object(
+                    BrowserSearchManager,
+                    "_start_temp_xvfb",
+                    return_value=(fake_xvfb, ":98"),
+                ),
+                patch.object(
+                    BrowserSearchManager,
+                    "_stop_temp_xvfb",
+                ) as stop_xvfb,
+                patch.object(
+                    BrowserSearchManager,
+                    "_load_login_playwright_factory",
+                    return_value=(fake_factory, "patchright"),
+                ),
+            ):
+                res = await manager.verify_start(engine="google", mode="login")
+                self.assertFalse(res["ok"])
+                self.assertIn("launch boom", res["reason"])
+                temp_playwright.stop.assert_awaited_once()
+                stop_xvfb.assert_called_once_with(fake_xvfb)
+                self.assertIsNone(manager._verify_session)
 
 
 class WorkerVerifyEndpointTests(TestCase):

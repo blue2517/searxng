@@ -7,9 +7,14 @@ import asyncio
 from dataclasses import dataclass
 import json
 import logging
+import os
 from pathlib import Path
 import secrets
+import select
 import shutil
+import subprocess
+import sys
+import tempfile
 import threading
 import time
 from typing import Any
@@ -57,6 +62,15 @@ BROWSER_ARGS = (
     "--disable-dev-shm-usage",
     "--disable-infobars",
     "--window-size=1280,800",
+)
+
+LOGIN_BROWSER_ARGS = (
+    "--no-sandbox",
+    "--disable-dev-shm-usage",
+    "--disable-infobars",
+    "--disable-blink-features=AutomationControlled",
+    "--window-size=1280,900",
+    "--window-position=0,0",
 )
 
 # Keep the page-level browser identity consistent with a normal Chrome session.
@@ -1233,6 +1247,318 @@ class BrowserSearchManager:
             return False
         return True
 
+    @staticmethod
+    def _start_temp_xvfb() -> tuple[subprocess.Popen[Any], str] | None:
+        if not sys.platform.startswith("linux"):
+            return None
+        xvfb_bin = shutil.which("Xvfb")
+        if not xvfb_bin:
+            return None
+        read_fd, write_fd = os.pipe()
+        proc: subprocess.Popen[Any] | None = None
+        try:
+            proc = subprocess.Popen(
+                [
+                    xvfb_bin,
+                    "-displayfd",
+                    str(write_fd),
+                    "-screen",
+                    "0",
+                    "1280x960x24",
+                    "-nolisten",
+                    "tcp",
+                    "-ac",
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                pass_fds=(write_fd,),
+                close_fds=True,
+            )
+            os.close(write_fd)
+            write_fd = -1
+            buf = b""
+            deadline = time.monotonic() + 10.0
+            while time.monotonic() < deadline:
+                remaining = max(0.05, deadline - time.monotonic())
+                ready, _, _ = select.select([read_fd], [], [], min(0.5, remaining))
+                if ready:
+                    chunk = os.read(read_fd, 64)
+                    if not chunk:
+                        break
+                    buf += chunk
+                    if b"\n" in buf:
+                        break
+                elif proc.poll() is not None:
+                    break
+            display_num = buf.decode("ascii", errors="ignore").strip().splitlines()
+            if display_num and display_num[0].isdigit() and proc.poll() is None:
+                return proc, f":{display_num[0]}"
+            stderr_text = ""
+            try:
+                if proc.stderr is not None and proc.poll() is not None:
+                    stderr_text = proc.stderr.read().decode("utf-8", errors="replace").strip()
+            except Exception:
+                pass
+            raise RuntimeError(f"Xvfb failed to start{': ' + stderr_text if stderr_text else ''}")
+        except Exception:
+            if proc is not None:
+                BrowserSearchManager._stop_temp_xvfb(proc)
+            raise
+        finally:
+            if write_fd >= 0:
+                try:
+                    os.close(write_fd)
+                except OSError:
+                    pass
+            try:
+                os.close(read_fd)
+            except OSError:
+                pass
+
+    @staticmethod
+    def _stop_temp_xvfb(proc: subprocess.Popen[Any] | None) -> None:
+        if proc is None:
+            return
+        try:
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait(timeout=5)
+        except Exception:
+            logger.debug("failed to stop temporary Xvfb", exc_info=True)
+        finally:
+            if proc.stderr is not None:
+                try:
+                    proc.stderr.close()
+                except Exception:
+                    pass
+
+    def _resolve_full_chromium_executable(self) -> str | None:
+        if self.executable_path and Path(self.executable_path).is_file():
+            return self.executable_path
+        search_roots: list[Path] = []
+        env_path = str(os.environ.get("PLAYWRIGHT_BROWSERS_PATH", "")).strip()
+        if env_path:
+            search_roots.append(Path(env_path))
+        search_roots.append(Path("/var/lib/searxng/playwright"))
+        try:
+            search_roots.append(Path.home() / ".cache" / "ms-playwright")
+        except Exception:
+            pass
+        for root in search_roots:
+            if not root.is_dir():
+                continue
+            candidates = sorted(
+                root.glob("chromium-*/chrome-linux*/chrome"),
+                key=lambda p: p.parent.parent.name,
+                reverse=True,
+            )
+            for candidate in candidates:
+                if candidate.is_file() and os.access(candidate, os.X_OK):
+                    return str(candidate)
+        for binary in ("google-chrome", "chromium", "chromium-browser", "chrome"):
+            found = shutil.which(binary)
+            if found:
+                return found
+        return None
+
+    @staticmethod
+    def _load_login_playwright_factory() -> tuple[Any, str]:
+        try:
+            from patchright.async_api import async_playwright as patchright_async
+
+            return patchright_async, "patchright"
+        except ImportError:
+            from playwright.async_api import async_playwright as playwright_async
+
+            return playwright_async, "playwright"
+
+    async def _invalidate_cached_context(self, key: str) -> None:
+        async def _drop() -> None:
+            context = self._contexts.get(key)
+            if context is None:
+                return
+            if self._context_active_pages.get(key, 0) > 0:
+                self._pending_context_close.add(key)
+                return
+            await self._close_context_key(key, context)
+
+        if self._context_lock is not None:
+            async with self._context_lock:
+                await _drop()
+        else:
+            await _drop()
+
+    async def _teardown_temporary_login_resources(
+        self, resources: dict[str, Any] | None
+    ) -> None:
+        if not resources:
+            return
+        page = resources.get("page")
+        context = resources.get("context")
+        temp_playwright = resources.get("playwright")
+        xvfb_proc = resources.get("xvfb")
+        temp_dir = resources.get("temp_dir")
+        if page is not None:
+            try:
+                await page.close()
+            except Exception:
+                pass
+        if context is not None:
+            try:
+                await context.close()
+            except Exception:
+                logger.debug("failed to close temporary login context", exc_info=True)
+        if temp_playwright is not None:
+            try:
+                await temp_playwright.stop()
+            except Exception:
+                logger.debug("failed to stop temporary login playwright", exc_info=True)
+        if xvfb_proc is not None:
+            await asyncio.to_thread(self._stop_temp_xvfb, xvfb_proc)
+        if temp_dir:
+            try:
+                shutil.rmtree(temp_dir, ignore_errors=True)
+            except Exception:
+                logger.debug("failed to remove temporary login profile dir", exc_info=True)
+
+    async def _start_temporary_login_session(
+        self, route: Route, locale: str, key: str, target_url: str
+    ) -> dict[str, Any]:
+        norm_locale = self._normalize_locale(locale, default="zh-CN") or "zh-CN"
+        xvfb_proc: subprocess.Popen[Any] | None = None
+        xvfb_display: str | None = None
+        temp_dir: Path | None = None
+        temp_playwright: Any = None
+        context: Any = None
+        page: Any = None
+        resources: dict[str, Any] = {}
+        try:
+            xvfb_started = await asyncio.to_thread(self._start_temp_xvfb)
+            if xvfb_started is not None:
+                xvfb_proc, xvfb_display = xvfb_started
+                resources["xvfb"] = xvfb_proc
+
+            temp_dir = Path(tempfile.mkdtemp(prefix="searxng-google-login-"))
+            resources["temp_dir"] = temp_dir
+
+            playwright_factory, driver_name = self._load_login_playwright_factory()
+            temp_playwright = await playwright_factory().start()
+            resources["playwright"] = temp_playwright
+
+            can_run_headed = bool(
+                xvfb_display
+                or not sys.platform.startswith("linux")
+                or os.environ.get("DISPLAY")
+            )
+            use_headless = not can_run_headed
+            launch_kwargs: dict[str, Any] = {
+                "headless": use_headless,
+                "args": list(LOGIN_BROWSER_ARGS),
+                "ignore_default_args": ["--enable-automation"],
+                "locale": norm_locale,
+            }
+            if use_headless:
+                launch_kwargs["viewport"] = {"width": 1280, "height": 800}
+            else:
+                launch_kwargs["no_viewport"] = True
+            if route.proxy:
+                launch_kwargs["proxy"] = self._proxy_config(route.proxy)
+            if xvfb_display:
+                env = dict(os.environ)
+                env["DISPLAY"] = xvfb_display
+                launch_kwargs["env"] = env
+            executable = self._resolve_full_chromium_executable()
+            if executable:
+                launch_kwargs["executable_path"] = executable
+            elif self.browser_channel:
+                launch_kwargs["channel"] = self.browser_channel
+
+            context = await temp_playwright.chromium.launch_persistent_context(
+                str(temp_dir), **launch_kwargs
+            )
+            resources["context"] = context
+
+            state_path = self._state_path(key)
+            if state_path.exists():
+                try:
+                    raw_state = json.loads(state_path.read_text(encoding="utf-8"))
+                    saved_cookies = [
+                        cookie
+                        for cookie in (raw_state.get("cookies") or [])
+                        if isinstance(cookie, dict)
+                        and cookie.get("name")
+                        and (cookie.get("domain") or cookie.get("url"))
+                    ]
+                    if saved_cookies:
+                        await context.add_cookies(saved_cookies)
+                except Exception:
+                    logger.debug(
+                        "failed to preload existing cookies into temporary login browser",
+                        exc_info=True,
+                    )
+
+            existing_pages = list(getattr(context, "pages", []) or [])
+            page = existing_pages[0] if existing_pages else await context.new_page()
+            resources["page"] = page
+            await page.goto(
+                target_url,
+                wait_until="domcontentloaded",
+                timeout=self.navigation_timeout,
+            )
+
+            viewport = {"width": 1280, "height": 800}
+            try:
+                measured = await page.evaluate(
+                    "() => ({width: window.innerWidth || 1280, height: window.innerHeight || 800})"
+                )
+                if isinstance(measured, dict):
+                    w = int(measured.get("width", 1280) or 1280)
+                    h = int(measured.get("height", 800) or 800)
+                    if w >= 200 and h >= 200:
+                        viewport = {"width": w, "height": h}
+            except Exception:
+                pass
+
+            logger.info(
+                "browser-search-temp-login-started driver=%s headless=%s display=%s route=%s viewport=%sx%s",
+                driver_name,
+                use_headless,
+                xvfb_display or "",
+                route.name,
+                viewport["width"],
+                viewport["height"],
+            )
+            return {
+                "session_id": secrets.token_urlsafe(12),
+                "engine": "google",
+                "mode": "login",
+                "route": route,
+                "locale": norm_locale,
+                "context_key": key,
+                "context": context,
+                "page": page,
+                "target_url": target_url,
+                "current_url": str(getattr(page, "url", "") or target_url),
+                "title": "",
+                "reason": "",
+                "solved": False,
+                "started_at": time.monotonic(),
+                "last_activity_at": time.monotonic(),
+                "last_frame": None,
+                "last_frame_at": 0.0,
+                "viewport": viewport,
+                "temporary_browser": True,
+                "login_driver": driver_name,
+                "temp_resources": resources,
+            }
+        except Exception:
+            await self._teardown_temporary_login_resources(resources)
+            raise
+
     async def _close_verify_session_locked(self) -> None:
         task = self._verify_reaper_task
         self._verify_reaper_task = None
@@ -1242,6 +1568,13 @@ class BrowserSearchManager:
         sess = self._verify_session
         self._verify_session = None
         if not sess:
+            return
+        if sess.get("temporary_browser"):
+            await self._teardown_temporary_login_resources(sess.get("temp_resources"))
+            logger.info(
+                "browser-search-temp-login-closed route=%s",
+                sess["route"].name,
+            )
             return
         await self._release_page(sess["context_key"], sess["context"], sess["page"])
 
@@ -1301,6 +1634,8 @@ class BrowserSearchManager:
                     reason=auth_reason or ("browser_login" if mode == "login" else "manual_verify"),
                     route=sess["route"].name,
                 )
+        if sess.get("temporary_browser"):
+            await self._invalidate_cached_context(key)
         challenge = self._last_challenges.get(engine)
         if isinstance(challenge, dict):
             challenge["solved"] = True
@@ -1322,6 +1657,7 @@ class BrowserSearchManager:
                 "reason": (last_challenge or {}).get("reason", ""),
                 "solved": bool((last_challenge or {}).get("solved", False)),
                 "viewport": {"width": 1280, "height": 800},
+                "temporary_browser": False,
                 "last_challenge": last_challenge,
             }
         return {
@@ -1335,7 +1671,8 @@ class BrowserSearchManager:
             "title": sess.get("title", ""),
             "reason": sess.get("reason", ""),
             "solved": bool(sess.get("solved", False)),
-            "viewport": {"width": 1280, "height": 800},
+            "viewport": dict(sess.get("viewport") or {"width": 1280, "height": 800}),
+            "temporary_browser": bool(sess.get("temporary_browser", False)),
             "last_challenge": self._last_challenges.get(sess["engine"]),
         }
 
@@ -1466,7 +1803,8 @@ class BrowserSearchManager:
             if engine_name == "google" and str(mode or "").strip().lower() == "login"
             else "verify"
         )
-        await self.start()
+        if session_mode != "login":
+            await self.start()
         async with self._ensure_verify_lock():
             existing = self._verify_session
             if (
@@ -1497,6 +1835,22 @@ class BrowserSearchManager:
                 if url and self._is_verify_url_allowed(engine_name, url)
                 else default_target
             )
+            if session_mode == "login":
+                key = self._context_key(route, locale, engine_name)
+                try:
+                    sess = await self._start_temporary_login_session(
+                        route, locale, key, target_url
+                    )
+                except Exception as exc:
+                    return {
+                        "ok": False,
+                        "status": "error",
+                        "reason": f"login_browser_start_failed:{exc}",
+                    }
+                self._verify_session = sess
+                self._schedule_verify_close(sess["session_id"], delay=self._verify_idle_ttl)
+                return await self._refresh_verify_state_locked(sess)
+
             key, context = await self._context(route, locale, engine_name)
             page = await context.new_page()
             self._context_active_pages[key] = self._context_active_pages.get(key, 0) + 1
@@ -1533,6 +1887,8 @@ class BrowserSearchManager:
                 "last_activity_at": time.monotonic(),
                 "last_frame": None,
                 "last_frame_at": 0.0,
+                "viewport": {"width": 1280, "height": 800},
+                "temporary_browser": False,
             }
             self._verify_session = sess
             self._schedule_verify_close(sess["session_id"], delay=self._verify_idle_ttl)
@@ -1578,10 +1934,13 @@ class BrowserSearchManager:
 
         kind = str(payload.get("kind", "")).strip().lower()
         sess["last_activity_at"] = time.monotonic()
+        viewport = sess.get("viewport") or {"width": 1280, "height": 800}
+        max_x = max(1, int(viewport.get("width", 1280)) - 1)
+        max_y = max(1, int(viewport.get("height", 800)) - 1)
         try:
             if kind in {"click", "move", "down", "up"}:
-                x = max(0, min(1279, int(round(float(payload.get("x", 0))))))
-                y = max(0, min(799, int(round(float(payload.get("y", 0))))))
+                x = max(0, min(max_x, int(round(float(payload.get("x", 0))))))
+                y = max(0, min(max_y, int(round(float(payload.get("y", 0))))))
                 button = str(payload.get("button", "left")).lower()
                 if button not in {"left", "right", "middle"}:
                     button = "left"
@@ -1838,7 +2197,7 @@ class BrowserSearchDispatcher:
             url=url,
             force_new=force_new,
             mode=mode,
-            timeout=45,
+            timeout=60,
         )
 
     def verify_frame(

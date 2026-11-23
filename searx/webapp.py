@@ -1198,7 +1198,7 @@ def browser_verify_start():
     }
     if payload.get('url'):
         body['url'] = str(payload.get('url'))
-    return _proxy_worker_json('POST', '/v1/verify/start', json_body=body, timeout=45.0)
+    return _proxy_worker_json('POST', '/v1/verify/start', json_body=body, timeout=60.0)
 
 
 @app.route('/browser-verify/frame', methods=['GET'])
