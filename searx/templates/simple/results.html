@@ -59,6 +59,16 @@
     {%- endif -%}
 
     <div id="urls" role="main">
+    {% if browser_verify_alerts %}
+      <div class="dialog-error-block" role="alert" style="margin-bottom: 1rem;">
+        {% for alert in browser_verify_alerts %}
+          <div>
+            <strong>{{ alert.engine_name }}</strong> 触发了人机验证，请手动打开网页过验证：
+            <a href="{{ alert.verify_url }}">打开网页验证</a>
+          </div>
+        {% endfor %}
+      </div>
+    {% endif %}
     {% for result in results %}
         {% if result.open_group and not only_template %}<div class="template_group_{{ result['template']|replace('.html', '') }}">{% endif %}
         {% set index = loop.index %}

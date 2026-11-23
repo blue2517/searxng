@@ -117,8 +117,10 @@ from searx import favicons
 from searx.valkeydb import initialize as valkey_initialize
 from searx.sxng_locales import sxng_locales
 import searx.search
+from searx.search.processors import PROCESSORS
 from searx.network import stream as http_stream, set_context_network_name
 from searx import server_config
+import httpx
 
 
 logger = logger.getChild('webapp')
@@ -774,6 +776,10 @@ def search():
     engine_timings = sorted(result_container.get_timings(), reverse=True, key=lambda e: e.total)
     max_response_time = engine_timings[0].total if engine_timings else None
     engine_timings_pairs = [(timing.engine, timing.total) for timing in engine_timings]
+    browser_verify_alerts = _browser_verify_alerts(
+        result_container.unresponsive_engines,
+        query=sxng_request.form.get('q', ''),
+    )
 
     # search_query.lang contains the user choice (all, auto, en, ...)
     # when the user choice is "auto", search.search_query.lang contains the detected language
@@ -795,6 +801,7 @@ def search():
         unresponsive_engines = webutils.get_translated_errors(
             result_container.unresponsive_engines
         ),
+        browser_verify_alerts = browser_verify_alerts,
         current_locale = sxng_request.preferences.get_value("locale"),
         current_language = selected_locale,
         search_language = match_locale(
@@ -1057,6 +1064,220 @@ def save_server_google_auth():
     return redirect(url_for('preferences', google_auth_saved='1'))
 
 
+_BROWSER_ENGINE_KEYS = {
+    'google browser': 'google',
+    'duckduckgo browser': 'duckduckgo',
+}
+_BROWSER_KEY_ENGINES = {v: k for k, v in _BROWSER_ENGINE_KEYS.items()}
+
+
+def _browser_verify_allowed():
+    browser_cfg = settings.get('browser_search', {}) or {}
+    if not browser_cfg.get('enabled'):
+        return False, Response('Browser search is disabled', status=404, mimetype='text/plain')
+    if not settings['server'].get('auth_username') or not settings['server'].get('auth_password'):
+        return False, Response('Browser verification requires HTTP Basic Auth', status=403, mimetype='text/plain')
+    return True, None
+
+
+def _browser_verify_endpoint() -> str:
+    browser_cfg = settings.get('browser_search', {}) or {}
+    return str(browser_cfg.get('endpoint', 'http://127.0.0.1:8890')).strip().rstrip('/')
+
+
+def _normalize_browser_engine_key(raw: str | None) -> str:
+    value = str(raw or 'google').strip().lower()
+    if value in _BROWSER_ENGINE_KEYS:
+        return _BROWSER_ENGINE_KEYS[value]
+    if value in _BROWSER_KEY_ENGINES:
+        return value
+    return 'google'
+
+
+def _resume_browser_engine(engine_key: str) -> None:
+    engine_name = _BROWSER_KEY_ENGINES.get(engine_key)
+    if not engine_name:
+        return
+    proc = PROCESSORS.get(engine_name)
+    if proc is not None:
+        proc.suspended_status.resume()
+
+
+def _browser_verify_alerts(unresponsive_engines, query: str = '') -> list[dict[str, str]]:
+    allowed, _ = _browser_verify_allowed()
+    if not allowed:
+        return []
+    alerts = []
+    seen = set()
+    verify_error_types = {
+        'searx.exceptions.SearxEngineCaptchaException',
+        'searx.exceptions.SearxEngineAccessDeniedException',
+        'httpx.HTTPStatusError',
+    }
+    for item in unresponsive_engines or ():
+        engine_name = getattr(item, 'engine', '')
+        error_type = getattr(item, 'error_type', '')
+        engine_key = _BROWSER_ENGINE_KEYS.get(engine_name)
+        if not engine_key or engine_key in seen:
+            continue
+        if error_type in verify_error_types:
+            seen.add(engine_key)
+            verify_url = url_for('browser_verify', engine=engine_key, q=query or None)
+            alerts.append(
+                {
+                    'engine_name': engine_name,
+                    'engine_key': engine_key,
+                    'verify_url': verify_url,
+                }
+            )
+    return alerts
+
+
+def _proxy_worker_json(method: str, path: str, *, params=None, json_body=None, timeout: float = 35.0):
+    endpoint = _browser_verify_endpoint()
+    try:
+        resp = httpx.request(
+            method,
+            f"{endpoint}{path}",
+            params=params,
+            json=json_body,
+            timeout=timeout,
+        )
+        return Response(resp.content, status=resp.status_code, mimetype='application/json')
+    except Exception as exc:
+        logger.warning("browser verify worker request %s %s failed: %s", method, path, exc)
+        return Response(
+            json.dumps({'ok': False, 'status': 'worker_unreachable', 'reason': str(exc)}),
+            status=502,
+            mimetype='application/json',
+        )
+
+
+@app.route('/browser-verify', methods=['GET'])
+def browser_verify():
+    """Interactive remote browser verification page for human CAPTCHA completion."""
+
+    allowed, err_resp = _browser_verify_allowed()
+    if not allowed:
+        return err_resp
+    engine_key = _normalize_browser_engine_key(sxng_request.args.get('engine'))
+    query = str(sxng_request.args.get('q', '')).strip()
+    return render(
+        'browser_verify.html',
+        verify_engine=engine_key,
+        verify_engine_name=_BROWSER_KEY_ENGINES[engine_key],
+        verify_query=query,
+    )
+
+
+@app.route('/browser-verify/status', methods=['GET'])
+def browser_verify_status():
+    allowed, err_resp = _browser_verify_allowed()
+    if not allowed:
+        return err_resp
+    engine_key = _normalize_browser_engine_key(sxng_request.args.get('engine'))
+    resp = _proxy_worker_json('GET', '/v1/verify/status', params={'engine': engine_key}, timeout=15.0)
+    try:
+        data = json.loads(resp.get_data(as_text=True))
+        if isinstance(data, dict) and data.get('solved'):
+            _resume_browser_engine(engine_key)
+    except Exception:
+        pass
+    return resp
+
+
+@app.route('/browser-verify/start', methods=['POST'])
+def browser_verify_start():
+    allowed, err_resp = _browser_verify_allowed()
+    if not allowed:
+        return err_resp
+    payload = sxng_request.get_json(silent=True) or {}
+    engine_key = _normalize_browser_engine_key(payload.get('engine'))
+    body = {
+        'engine': engine_key,
+        'force_new': bool(payload.get('force_new', False)),
+    }
+    if payload.get('url'):
+        body['url'] = str(payload.get('url'))
+    return _proxy_worker_json('POST', '/v1/verify/start', json_body=body, timeout=45.0)
+
+
+@app.route('/browser-verify/frame', methods=['GET'])
+def browser_verify_frame():
+    allowed, err_resp = _browser_verify_allowed()
+    if not allowed:
+        return err_resp
+    engine_key = _normalize_browser_engine_key(sxng_request.args.get('engine'))
+    force = '1' if sxng_request.args.get('force') in {'1', 'true'} else '0'
+    endpoint = _browser_verify_endpoint()
+    try:
+        resp = httpx.get(
+            f"{endpoint}/v1/verify/frame",
+            params={'engine': engine_key, 'force': force},
+            timeout=15.0,
+        )
+        headers = {'Cache-Control': 'no-store'}
+        for header_name in ('X-Verify-Solved', 'X-Verify-Reason'):
+            if header_name in resp.headers:
+                headers[header_name] = resp.headers[header_name]
+        return Response(
+            resp.content,
+            status=resp.status_code,
+            mimetype=resp.headers.get('Content-Type', 'image/jpeg'),
+            headers=headers,
+        )
+    except Exception as exc:
+        return Response(
+            json.dumps({'ok': False, 'status': 'worker_unreachable', 'reason': str(exc)}),
+            status=502,
+            mimetype='application/json',
+        )
+
+
+@app.route('/browser-verify/input', methods=['POST'])
+def browser_verify_input():
+    allowed, err_resp = _browser_verify_allowed()
+    if not allowed:
+        return err_resp
+    payload = sxng_request.get_json(silent=True) or {}
+    engine_key = _normalize_browser_engine_key(payload.get('engine'))
+    payload['engine'] = engine_key
+    resp = _proxy_worker_json('POST', '/v1/verify/input', json_body=payload, timeout=30.0)
+    try:
+        data = json.loads(resp.get_data(as_text=True))
+        if isinstance(data, dict) and data.get('solved'):
+            _resume_browser_engine(engine_key)
+    except Exception:
+        pass
+    return resp
+
+
+@app.route('/browser-verify/complete', methods=['POST'])
+def browser_verify_complete():
+    allowed, err_resp = _browser_verify_allowed()
+    if not allowed:
+        return err_resp
+    payload = sxng_request.get_json(silent=True) or {}
+    engine_key = _normalize_browser_engine_key(payload.get('engine'))
+    resp = _proxy_worker_json(
+        'POST',
+        '/v1/verify/complete',
+        json_body={'engine': engine_key, 'close_session': bool(payload.get('close_session', True))},
+        timeout=30.0,
+    )
+    if resp.status_code == 200:
+        _resume_browser_engine(engine_key)
+    return resp
+
+
+@app.route('/browser-verify/close', methods=['POST'])
+def browser_verify_close():
+    allowed, err_resp = _browser_verify_allowed()
+    if not allowed:
+        return err_resp
+    return _proxy_worker_json('POST', '/v1/verify/close', json_body={}, timeout=15.0)
+
+
 app.add_url_rule('/favicon_proxy', methods=['GET'], endpoint="favicon_proxy", view_func=favicons.favicon_proxy)
 
 
@@ -1205,6 +1426,11 @@ def stats():
         )
     technical_report = ' '.join(technical_report)
 
+    browser_verify_url = None
+    allowed, _ = _browser_verify_allowed()
+    if allowed and selected_engine_name in _BROWSER_ENGINE_KEYS:
+        browser_verify_url = url_for('browser_verify', engine=_BROWSER_ENGINE_KEYS[selected_engine_name])
+
     engine_stats['time'] = sorted(engine_stats['time'], reverse=reverse, key=get_key)
     return render(
         # fmt: off
@@ -1214,6 +1440,7 @@ def stats():
         engine_reliabilities = engine_reliabilities,
         selected_engine_name = selected_engine_name,
         technical_report = technical_report,
+        browser_verify_url = browser_verify_url,
         # fmt: on
     )
 

@@ -8,16 +8,18 @@ from dataclasses import dataclass
 import json
 import logging
 from pathlib import Path
+import secrets
 import shutil
 import threading
 import time
 from typing import Any
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlparse
 
 from .auth_state import (
     extract_google_storage_state,
     get_google_auth_status,
     has_google_auth_cookies,
+    is_google_cookie_domain,
     load_google_auth_state,
     merge_storage_states,
     resolve_google_auth_path,
@@ -245,6 +247,15 @@ class BrowserSearchManager:
         self._state_locks: dict[str, asyncio.Lock] = {}
         self._context_lock: asyncio.Lock | None = None
         self._start_lock: asyncio.Lock | None = None
+        self._verify_lock: asyncio.Lock | None = None
+        self._verify_session: dict[str, Any] | None = None
+        self._verify_reaper_task: asyncio.Task[Any] | None = None
+        self._last_challenges: dict[str, dict[str, Any]] = {}
+        try:
+            verify_ttl = float(config.get("verify_idle_ttl", 300))
+        except (TypeError, ValueError):
+            verify_ttl = 300.0
+        self._verify_idle_ttl = max(60.0, min(3600.0, verify_ttl))
 
     @property
     def browser(self) -> Any:
@@ -377,6 +388,11 @@ class BrowserSearchManager:
     async def close(self) -> None:
         """Close all contexts and the singleton Chromium instance."""
 
+        if self._verify_session is not None:
+            try:
+                await self._close_verify_session_locked()
+            except Exception:
+                logger.debug("failed to close verification session", exc_info=True)
         if self._browser is None and self._playwright is None:
             return
         contexts = list(self._contexts.items())
@@ -1053,12 +1069,74 @@ class BrowserSearchManager:
         )
         return result if isinstance(result, list) else []
 
+    _CHALLENGE_REASONS = frozenset(
+        {
+            "google_challenge_url",
+            "duckduckgo_challenge_url",
+            "captcha",
+            "consent_required",
+            "unusual_traffic",
+        }
+    )
+
+    def _record_blocked_result(
+        self,
+        request: SearchRequest,
+        route: Route,
+        page: Any,
+        search_url: str,
+        reason: str,
+    ) -> dict[str, Any]:
+        engine = request.engine or "google"
+        challenge_url = str(getattr(page, "url", "") or search_url)
+        if reason in self._CHALLENGE_REASONS:
+            self._last_challenges[engine] = {
+                "engine": engine,
+                "route": route.name,
+                "profile_key": route.profile_key,
+                "locale": request.locale,
+                "query": request.query,
+                "search_url": search_url,
+                "challenge_url": challenge_url,
+                "reason": reason,
+                "occurred_at": time.time(),
+                "solved": False,
+            }
+        return {
+            "ok": False,
+            "status": "blocked",
+            "reason": reason,
+            "route": route.name,
+            "challenge_url": challenge_url,
+            "verify_path": f"/browser-verify?engine={engine}",
+        }
+
     async def _perform(self, request: SearchRequest, route: Route) -> dict[str, Any]:
         started_at = time.perf_counter()
+        engine = request.engine or "google"
+        if engine not in self.SUPPORTED_ENGINES:
+            return {
+                "ok": False,
+                "status": "invalid_request",
+                "reason": f"unsupported_engine:{engine}",
+                "route": route.name,
+            }
+        key_preview = self._context_key(route, request.locale, engine)
+        active_verify = self._verify_session
+        if (
+            active_verify is not None
+            and not active_verify.get("solved")
+            and active_verify.get("context_key") == key_preview
+        ):
+            return {
+                "ok": False,
+                "status": "blocked",
+                "reason": "verification_in_progress",
+                "route": route.name,
+                "verify_path": f"/browser-verify?engine={engine}",
+            }
         await self._wait_route_cooldown(request, route)
-        key, context = await self._context(
-            route, request.locale, request.engine or "google"
-        )
+        key, context = await self._context(route, request.locale, engine)
         _timing_event(request, "context_ready", route=route.name, context_key=key)
         page = await context.new_page()
         self._context_active_pages[key] = self._context_active_pages.get(key, 0) + 1
@@ -1069,21 +1147,13 @@ class BrowserSearchManager:
             context_key=key,
             active_pages=self._context_active_pages[key],
         )
+        url = (
+            self._duckduckgo_url(request)
+            if engine == "duckduckgo"
+            else self._google_url(request)
+        )
         try:
             await self._apply_page_profile(context, page, request.locale)
-            engine = request.engine or "google"
-            if engine not in self.SUPPORTED_ENGINES:
-                return {
-                    "ok": False,
-                    "status": "invalid_request",
-                    "reason": f"unsupported_engine:{engine}",
-                    "route": route.name,
-                }
-            url = (
-                self._duckduckgo_url(request)
-                if engine == "duckduckgo"
-                else self._google_url(request)
-            )
             navigation_started_at = time.perf_counter()
             try:
                 response = await page.goto(
@@ -1106,12 +1176,9 @@ class BrowserSearchManager:
                     "route": route.name,
                 }
             if response is not None and response.status in {401, 403}:
-                return {
-                    "ok": False,
-                    "status": "blocked",
-                    "reason": f"http_{response.status}",
-                    "route": route.name,
-                }
+                return self._record_blocked_result(
+                    request, route, page, url, f"http_{response.status}"
+                )
 
             reason = await self._block_reason(page, engine)
             if reason == "consent_required":
@@ -1134,12 +1201,7 @@ class BrowserSearchManager:
                 request, "block_checked", reason=reason or "", route=route.name
             )
             if reason:
-                return {
-                    "ok": False,
-                    "status": "blocked",
-                    "reason": reason,
-                    "route": route.name,
-                }
+                return self._record_blocked_result(request, route, page, url, reason)
 
             selector_started_at = time.perf_counter()
             matched = await self._wait_for_results(page, engine, self.selector_timeout)
@@ -1147,12 +1209,9 @@ class BrowserSearchManager:
             if not matched:
                 reason = await self._block_reason(page, engine)
                 if reason:
-                    return {
-                        "ok": False,
-                        "status": "blocked",
-                        "reason": reason,
-                        "route": route.name,
-                    }
+                    return self._record_blocked_result(
+                        request, route, page, url, reason
+                    )
             _timing_event(
                 request,
                 "selector_wait_completed",
@@ -1180,18 +1239,12 @@ class BrowserSearchManager:
                 if not any(marker in page_text for marker in no_results_markers):
                     reason = await self._block_reason(page, engine)
                     if reason:
-                        return {
-                            "ok": False,
-                            "status": "blocked",
-                            "reason": reason,
-                            "route": route.name,
-                        }
-                    return {
-                        "ok": False,
-                        "status": "blocked",
-                        "reason": "no_results_extracted",
-                        "route": route.name,
-                    }
+                        return self._record_blocked_result(
+                            request, route, page, url, reason
+                        )
+                    return self._record_blocked_result(
+                        request, route, page, url, "no_results_extracted"
+                    )
             await self._save_state(key, context)
             if engine == "google":
                 await self._update_google_auth_after_search(page, context, results)
@@ -1202,12 +1255,7 @@ class BrowserSearchManager:
             except Exception:
                 reason = None
             if reason:
-                return {
-                    "ok": False,
-                    "status": "blocked",
-                    "reason": reason,
-                    "route": route.name,
-                }
+                return self._record_blocked_result(request, route, page, url, reason)
             return {
                 "ok": False,
                 "status": "route_error",
@@ -1485,6 +1533,419 @@ class BrowserSearchManager:
                     pass
         return get_google_auth_status(self.google_auth_state_path)
 
+    def _ensure_verify_lock(self) -> asyncio.Lock:
+        if self._verify_lock is None:
+            self._verify_lock = asyncio.Lock()
+        return self._verify_lock
+
+    @staticmethod
+    def _is_verify_url_allowed(engine: str, url: str) -> bool:
+        parsed = urlparse(str(url or "").strip())
+        if parsed.scheme != "https" or not parsed.hostname:
+            return False
+        host = parsed.hostname.lower()
+        if engine == "duckduckgo":
+            return host == "duckduckgo.com" or host.endswith(".duckduckgo.com")
+        return is_google_cookie_domain(host)
+
+    @staticmethod
+    def _is_google_results_or_exempt_url(url: str) -> bool:
+        parsed = urlparse(str(url or ""))
+        host = (parsed.hostname or "").lower()
+        if not is_google_cookie_domain(host):
+            return False
+        path = parsed.path or ""
+        if "/sorry/" in path or "/challenge/" in path:
+            return False
+        if host.startswith("consent.") or host.startswith("accounts."):
+            return False
+        return True
+
+    async def _close_verify_session_locked(self) -> None:
+        task = self._verify_reaper_task
+        self._verify_reaper_task = None
+        current = asyncio.current_task()
+        if task is not None and task is not current and not task.done():
+            task.cancel()
+        sess = self._verify_session
+        self._verify_session = None
+        if not sess:
+            return
+        await self._release_page(sess["context_key"], sess["context"], sess["page"])
+
+    def _schedule_verify_close(self, session_id: str, delay: float) -> None:
+        task = self._verify_reaper_task
+        if task is not None and not task.done():
+            task.cancel()
+
+        async def _reap() -> None:
+            try:
+                await asyncio.sleep(max(0.0, delay))
+            except asyncio.CancelledError:
+                return
+            async with self._ensure_verify_lock():
+                sess = self._verify_session
+                if sess is None or sess.get("session_id") != session_id:
+                    return
+                if not sess.get("solved"):
+                    idle = time.monotonic() - float(sess.get("last_activity_at", 0.0))
+                    if idle < self._verify_idle_ttl:
+                        self._schedule_verify_close(
+                            session_id, max(1.0, self._verify_idle_ttl - idle)
+                        )
+                        return
+                await self._close_verify_session_locked()
+                logger.info(
+                    "browser-search-verify-closed-automatically session_id=%s solved=%s",
+                    session_id,
+                    bool(sess.get("solved", False)),
+                )
+
+        self._verify_reaper_task = asyncio.create_task(_reap())
+
+    async def _persist_verified_context(self, sess: dict[str, Any]) -> None:
+        key = sess["context_key"]
+        context = sess["context"]
+        engine = sess["engine"]
+        await self._save_state(key, context)
+        self._force_clean_context.discard(key)
+        self._route_cooldowns.pop(key, None)
+        if engine == "google" and self.persist_google_auth and self.google_auth_state_path.exists():
+            try:
+                raw_state = await context.storage_state()
+                if isinstance(raw_state, dict):
+                    google_state = extract_google_storage_state(raw_state)
+                    existing = load_google_auth_state(self.google_auth_state_path)
+                    merged = merge_storage_states(existing, google_state)
+                    if merged.get("cookies"):
+                        save_google_auth_state(
+                            self.google_auth_state_path,
+                            merged,
+                            source_format="refresh",
+                            last_auth_ok=True if has_google_auth_cookies(merged["cookies"]) else None,
+                            last_reason="manual_verify",
+                        )
+            except Exception:
+                logger.debug("failed to refresh google auth after manual verify", exc_info=True)
+        challenge = self._last_challenges.get(engine)
+        if isinstance(challenge, dict):
+            challenge["solved"] = True
+
+    def _serialize_verify_status(
+        self, engine: str, sess: dict[str, Any] | None
+    ) -> dict[str, Any]:
+        last_challenge = self._last_challenges.get(engine)
+        if sess is None:
+            return {
+                "ok": True,
+                "active": False,
+                "session_id": "",
+                "engine": engine,
+                "route": (last_challenge or {}).get("route", "direct"),
+                "current_url": "",
+                "title": "",
+                "reason": (last_challenge or {}).get("reason", ""),
+                "solved": bool((last_challenge or {}).get("solved", False)),
+                "viewport": {"width": 1280, "height": 800},
+                "last_challenge": last_challenge,
+            }
+        return {
+            "ok": True,
+            "active": True,
+            "session_id": sess["session_id"],
+            "engine": sess["engine"],
+            "route": sess["route"].name,
+            "current_url": sess.get("current_url", ""),
+            "title": sess.get("title", ""),
+            "reason": sess.get("reason", ""),
+            "solved": bool(sess.get("solved", False)),
+            "viewport": {"width": 1280, "height": 800},
+            "last_challenge": self._last_challenges.get(sess["engine"]),
+        }
+
+    async def _refresh_verify_state_locked(
+        self, sess: dict[str, Any]
+    ) -> dict[str, Any]:
+        page = sess["page"]
+        context = sess["context"]
+        engine = sess["engine"]
+        if (time.monotonic() - sess["last_activity_at"]) > self._verify_idle_ttl:
+            await self._close_verify_session_locked()
+            return self._serialize_verify_status(engine, None)
+        if getattr(page, "is_closed", lambda: False)():
+            await self._close_verify_session_locked()
+            return self._serialize_verify_status(engine, None)
+
+        current_url = str(getattr(page, "url", "") or "")
+        sess["current_url"] = current_url
+        try:
+            sess["title"] = str(await page.title() or "")
+        except Exception:
+            sess["title"] = ""
+
+        try:
+            reason = await self._block_reason(page, engine)
+        except Exception:
+            reason = None
+        sess["reason"] = reason or ""
+
+        solved = False
+        if not reason:
+            if engine == "duckduckgo":
+                host = (urlparse(current_url).hostname or "").lower()
+                if (host == "duckduckgo.com" or host.endswith(".duckduckgo.com")) and (
+                    await self._wait_for_results(page, "duckduckgo", 60)
+                ):
+                    solved = True
+            elif self._is_google_results_or_exempt_url(current_url):
+                if await self._wait_for_results(page, "google", 60):
+                    solved = True
+                elif "/search" in current_url:
+                    try:
+                        cookies = await context.cookies(["https://www.google.com"])
+                        if any(
+                            c.get("name") == "GOOGLE_ABUSE_EXEMPTION" and c.get("value")
+                            for c in cookies
+                        ):
+                            solved = True
+                    except Exception:
+                        pass
+
+        if solved and not sess.get("solved"):
+            await self._persist_verified_context(sess)
+            sess["solved"] = True
+            self._schedule_verify_close(sess["session_id"], delay=3.0)
+            logger.info(
+                "browser-search-verify-solved engine=%s route=%s url=%s",
+                engine,
+                sess["route"].name,
+                current_url,
+            )
+        return self._serialize_verify_status(engine, sess)
+
+    def _resolve_verify_route(self, engine: str) -> tuple[Route, str, str]:
+        challenge = self._last_challenges.get(engine) or {}
+        locale = self._normalize_locale(challenge.get("locale"), default="zh-CN") or "zh-CN"
+        profile_key = str(challenge.get("profile_key") or "direct")
+        route = Route("direct", "direct")
+        if profile_key != "direct" and self.proxy_pool_enabled:
+            for proxy in self.proxy_pool.round():
+                if proxy.key == profile_key:
+                    route = Route(proxy.display_name, proxy.key, proxy)
+                    break
+        default_url = (
+            "https://duckduckgo.com/?q=test"
+            if engine == "duckduckgo"
+            else f"https://www.google.com/search?q=test&gl=hk&hl={locale}"
+        )
+        search_url = str(challenge.get("search_url") or "")
+        if not self._is_verify_url_allowed(engine, search_url):
+            search_url = default_url
+        return route, locale, search_url
+
+    async def verify_status(self, engine: str = "google") -> dict[str, Any]:
+        engine_name = (engine or "google").strip().lower()
+        if engine_name not in self.SUPPORTED_ENGINES:
+            return {"ok": False, "status": "invalid_request", "reason": f"unsupported_engine:{engine_name}"}
+        async with self._ensure_verify_lock():
+            sess = self._verify_session
+            if sess is None:
+                return self._serialize_verify_status(engine_name, None)
+            if sess["engine"] != engine_name:
+                return self._serialize_verify_status(engine_name, None)
+            return await self._refresh_verify_state_locked(sess)
+
+    async def verify_start(
+        self, engine: str = "google", url: str | None = None, force_new: bool = False
+    ) -> dict[str, Any]:
+        engine_name = (engine or "google").strip().lower()
+        if engine_name not in self.SUPPORTED_ENGINES:
+            return {"ok": False, "status": "invalid_request", "reason": f"unsupported_engine:{engine_name}"}
+        await self.start()
+        async with self._ensure_verify_lock():
+            existing = self._verify_session
+            if (
+                existing is not None
+                and not force_new
+                and existing["engine"] == engine_name
+                and not getattr(existing["page"], "is_closed", lambda: False)()
+                and (time.monotonic() - existing["last_activity_at"]) <= self._verify_idle_ttl
+            ):
+                if url and self._is_verify_url_allowed(engine_name, url):
+                    await existing["page"].goto(
+                        url, wait_until="domcontentloaded", timeout=self.navigation_timeout
+                    )
+                    existing["last_frame"] = None
+                    existing["last_frame_at"] = 0.0
+                existing["last_activity_at"] = time.monotonic()
+                return await self._refresh_verify_state_locked(existing)
+
+            if existing is not None:
+                await self._close_verify_session_locked()
+
+            route, locale, default_target = self._resolve_verify_route(engine_name)
+            target_url = (
+                url
+                if url and self._is_verify_url_allowed(engine_name, url)
+                else default_target
+            )
+            key = self._context_key(route, locale, engine_name)
+            self._force_clean_context.discard(key)
+            self._route_cooldowns.pop(key, None)
+            key, context = await self._context(route, locale, engine_name)
+            page = await context.new_page()
+            self._context_active_pages[key] = self._context_active_pages.get(key, 0) + 1
+            try:
+                await self._apply_page_profile(context, page, locale)
+                await page.goto(
+                    target_url,
+                    wait_until="domcontentloaded",
+                    timeout=self.navigation_timeout,
+                )
+            except Exception as exc:
+                await self._release_page(key, context, page)
+                return {
+                    "ok": False,
+                    "status": "error",
+                    "reason": f"verify_navigation_failed:{exc}",
+                }
+
+            sess = {
+                "session_id": secrets.token_urlsafe(12),
+                "engine": engine_name,
+                "route": route,
+                "locale": locale,
+                "context_key": key,
+                "context": context,
+                "page": page,
+                "target_url": target_url,
+                "current_url": str(getattr(page, "url", "") or target_url),
+                "title": "",
+                "reason": "",
+                "solved": False,
+                "started_at": time.monotonic(),
+                "last_activity_at": time.monotonic(),
+                "last_frame": None,
+                "last_frame_at": 0.0,
+            }
+            self._verify_session = sess
+            self._schedule_verify_close(sess["session_id"], delay=self._verify_idle_ttl)
+            return await self._refresh_verify_state_locked(sess)
+
+    async def verify_frame(
+        self, engine: str = "google", force: bool = False
+    ) -> tuple[bytes, dict[str, Any]]:
+        engine_name = (engine or "google").strip().lower()
+        sess = self._verify_session
+        if sess is None or (engine_name and sess["engine"] != engine_name):
+            raise ValueError("no active verification session")
+        if getattr(sess["page"], "is_closed", lambda: False)():
+            async with self._ensure_verify_lock():
+                await self._close_verify_session_locked()
+            raise ValueError("verification session is closed")
+        now = time.monotonic()
+        cached = sess.get("last_frame")
+        if not force and cached and (now - float(sess.get("last_frame_at", 0.0))) < 0.15:
+            return cached, self._serialize_verify_status(sess["engine"], sess)
+        try:
+            frame = await sess["page"].screenshot(type="jpeg", quality=80)
+        except Exception as exc:
+            if cached:
+                return cached, self._serialize_verify_status(sess["engine"], sess)
+            raise ValueError(f"screenshot temporarily unavailable: {exc}") from exc
+        sess["last_frame"] = frame
+        sess["last_frame_at"] = now
+        sess["last_activity_at"] = now
+        status = self._serialize_verify_status(sess["engine"], sess)
+        return frame, status
+
+    async def verify_input(self, payload: dict[str, Any]) -> dict[str, Any]:
+        engine_name = str(payload.get("engine", "google")).strip().lower()
+        sess = self._verify_session
+        if sess is None or (engine_name and sess["engine"] != engine_name):
+            return {"ok": False, "status": "no_session", "reason": "no active verification session"}
+        page = sess["page"]
+        if getattr(page, "is_closed", lambda: False)():
+            async with self._ensure_verify_lock():
+                await self._close_verify_session_locked()
+            return {"ok": False, "status": "no_session", "reason": "verification page is closed"}
+
+        kind = str(payload.get("kind", "")).strip().lower()
+        sess["last_activity_at"] = time.monotonic()
+        try:
+            if kind in {"click", "move", "down", "up"}:
+                x = max(0, min(1279, int(round(float(payload.get("x", 0))))))
+                y = max(0, min(799, int(round(float(payload.get("y", 0))))))
+                button = str(payload.get("button", "left")).lower()
+                if button not in {"left", "right", "middle"}:
+                    button = "left"
+                if kind == "click":
+                    click_count = max(1, min(2, int(payload.get("click_count", 1))))
+                    await page.mouse.click(x, y, button=button, click_count=click_count)
+                elif kind == "move":
+                    await page.mouse.move(x, y)
+                elif kind == "down":
+                    await page.mouse.down(button=button)
+                elif kind == "up":
+                    await page.mouse.up(button=button)
+            elif kind == "wheel":
+                dx = max(-2000, min(2000, float(payload.get("delta_x", 0))))
+                dy = max(-2000, min(2000, float(payload.get("delta_y", 0))))
+                await page.mouse.wheel(dx, dy)
+            elif kind == "type":
+                text = str(payload.get("text", ""))[:500]
+                if text:
+                    await page.keyboard.type(text)
+            elif kind == "press":
+                key = str(payload.get("key", "")).strip()[:32]
+                if key:
+                    await page.keyboard.press(key)
+            elif kind == "reload":
+                await page.reload(
+                    wait_until="domcontentloaded", timeout=self.navigation_timeout
+                )
+            elif kind == "goto":
+                url = str(payload.get("url", "")).strip()
+                if not self._is_verify_url_allowed(sess["engine"], url):
+                    return {"ok": False, "status": "invalid_request", "reason": "disallowed verification URL"}
+                await page.goto(
+                    url, wait_until="domcontentloaded", timeout=self.navigation_timeout
+                )
+            else:
+                return {"ok": False, "status": "invalid_request", "reason": f"unsupported input kind: {kind}"}
+        except Exception as exc:
+            return {"ok": False, "status": "error", "reason": str(exc)}
+
+        await asyncio.sleep(0.15)
+        sess["last_frame"] = None
+        sess["last_frame_at"] = 0.0
+        async with self._ensure_verify_lock():
+            if self._verify_session is not sess:
+                return self._serialize_verify_status(engine_name, None)
+            return await self._refresh_verify_state_locked(sess)
+
+    async def verify_complete(
+        self, engine: str = "google", close_session: bool = True
+    ) -> dict[str, Any]:
+        engine_name = (engine or "google").strip().lower()
+        async with self._ensure_verify_lock():
+            sess = self._verify_session
+            if sess is None or (engine_name and sess["engine"] != engine_name):
+                return self._serialize_verify_status(engine_name, None)
+            status = await self._refresh_verify_state_locked(sess)
+            await self._persist_verified_context(sess)
+            status["solved"] = True
+            if close_session:
+                await self._close_verify_session_locked()
+                status["active"] = False
+            return status
+
+    async def verify_close(self) -> dict[str, Any]:
+        async with self._ensure_verify_lock():
+            engine_name = (self._verify_session or {}).get("engine", "google")
+            await self._close_verify_session_locked()
+            return self._serialize_verify_status(engine_name, None)
+
 
 class BrowserSearchDispatcher:
     """Thread-safe SearXNG facade backed by one async Chromium runtime."""
@@ -1635,19 +2096,52 @@ class BrowserSearchDispatcher:
         future = asyncio.run_coroutine_threadsafe(self._search(request), self._loop)
         return future.result()
 
-    def reload_google_auth(self, *, clear_route_states: bool = False) -> dict[str, Any]:
+    def _call_manager(self, method: str, *args: Any, timeout: float = 30, **kwargs: Any) -> Any:
         if not self._ready.wait(timeout=60):
             raise RuntimeError("browser search runtime is not ready")
         if self._manager is None:
             raise RuntimeError("browser search runtime is not initialized")
-        future = asyncio.run_coroutine_threadsafe(
-            self._manager.reload_google_auth(clear_route_states=clear_route_states),
-            self._loop,
+        coro = getattr(self._manager, method)(*args, **kwargs)
+        future = asyncio.run_coroutine_threadsafe(coro, self._loop)
+        return future.result(timeout=timeout)
+
+    def reload_google_auth(self, *, clear_route_states: bool = False) -> dict[str, Any]:
+        return self._call_manager(
+            "reload_google_auth", clear_route_states=clear_route_states, timeout=30
         )
-        return future.result(timeout=30)
 
     def google_auth_status(self) -> dict[str, Any]:
         return get_google_auth_status(resolve_google_auth_path(self.config))
+
+    def verify_status(self, engine: str = "google") -> dict[str, Any]:
+        return self._call_manager("verify_status", engine, timeout=15)
+
+    def verify_start(
+        self, engine: str = "google", url: str | None = None, force_new: bool = False
+    ) -> dict[str, Any]:
+        return self._call_manager(
+            "verify_start", engine=engine, url=url, force_new=force_new, timeout=45
+        )
+
+    def verify_frame(
+        self, engine: str = "google", force: bool = False
+    ) -> tuple[bytes, dict[str, Any]]:
+        return self._call_manager(
+            "verify_frame", engine=engine, force=force, timeout=15
+        )
+
+    def verify_input(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return self._call_manager("verify_input", payload, timeout=30)
+
+    def verify_complete(
+        self, engine: str = "google", close_session: bool = True
+    ) -> dict[str, Any]:
+        return self._call_manager(
+            "verify_complete", engine=engine, close_session=close_session, timeout=30
+        )
+
+    def verify_close(self) -> dict[str, Any]:
+        return self._call_manager("verify_close", timeout=15)
 
     def close(self) -> None:
         if not self._thread.is_alive():

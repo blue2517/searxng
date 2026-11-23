@@ -1,0 +1,400 @@
+{% extends "simple/page_with_header.html" %}
+{% block title %}网页人机验证 - {% endblock %}
+{% block head %}
+<style>
+  .bv-wrap {
+    max-width: 1120px;
+    margin: 1rem auto;
+    padding: 0 1rem 2rem;
+  }
+  .bv-card {
+    background: var(--color-base-background, #fff);
+    border: 1px solid var(--color-base-font-muted, #d0d7de);
+    border-radius: 10px;
+    padding: 1rem 1.25rem;
+    margin-bottom: 1rem;
+  }
+  .bv-header {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.75rem;
+  }
+  .bv-header h1 {
+    margin: 0;
+    font-size: 1.35rem;
+  }
+  .bv-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+    align-items: center;
+  }
+  .bv-btn {
+    display: inline-block;
+    padding: 0.45rem 0.85rem;
+    border-radius: 6px;
+    border: 1px solid #8c959f;
+    background: #f6f8fa;
+    color: #24292f;
+    text-decoration: none;
+    cursor: pointer;
+    font-size: 0.9rem;
+  }
+  .bv-btn:hover {
+    background: #eaeef2;
+  }
+  .bv-btn-primary {
+    background: #1f6feb;
+    border-color: #1f6feb;
+    color: #fff;
+  }
+  .bv-btn-primary:hover {
+    background: #1a5cd8;
+  }
+  .bv-btn-success {
+    background: #1a7f37;
+    border-color: #1a7f37;
+    color: #fff;
+  }
+  .bv-btn-success:hover {
+    background: #15692c;
+  }
+  .bv-status {
+    margin-top: 0.75rem;
+    padding: 0.65rem 0.85rem;
+    border-radius: 6px;
+    background: #f6f8fa;
+    color: #24292f;
+    font-size: 0.92rem;
+    word-break: break-all;
+  }
+  .bv-status.is-solved {
+    background: #dafbe1;
+    border: 1px solid #1a7f37;
+    color: #116329;
+  }
+  .bv-status.is-error {
+    background: #ffebe9;
+    border: 1px solid #cf222e;
+    color: #82071e;
+  }
+  .bv-toolbar {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+    align-items: center;
+    margin-bottom: 0.75rem;
+  }
+  .bv-input-text {
+    flex: 1 1 220px;
+    min-width: 160px;
+    padding: 0.42rem 0.6rem;
+    border: 1px solid #8c959f;
+    border-radius: 6px;
+    font-size: 0.9rem;
+  }
+  .bv-viewport-box {
+    position: relative;
+    width: 100%;
+    max-width: 1280px;
+    aspect-ratio: 1280 / 800;
+    border: 1px solid #8c959f;
+    border-radius: 8px;
+    overflow: hidden;
+    background: #1b1f23;
+    user-select: none;
+  }
+  .bv-screen {
+    display: block;
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
+    cursor: pointer;
+    touch-action: manipulation;
+  }
+  .bv-placeholder {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: #d0d7de;
+    font-size: 1rem;
+    pointer-events: none;
+  }
+  .bv-hint {
+    margin: 0.5rem 0 0;
+    font-size: 0.85rem;
+    color: #57606a;
+  }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="bv-wrap">
+  <div class="bv-card">
+    <div class="bv-header">
+      <h1>网页人机验证（{{ verify_engine_name }}）</h1>
+      <div class="bv-actions">
+        <a class="bv-btn" href="{{ url_for('browser_verify', engine='google', q=verify_query or None) }}">Google</a>
+        <a class="bv-btn" href="{{ url_for('browser_verify', engine='duckduckgo', q=verify_query or None) }}">DuckDuckGo</a>
+        {% if verify_query %}
+          <a class="bv-btn bv-btn-primary" id="bv-retry-search" href="{{ url_for('search') }}?q={{ verify_query|urlencode }}">重新搜索：{{ verify_query }}</a>
+        {% else %}
+          <a class="bv-btn" href="{{ url_for('index') }}">返回首页</a>
+        {% endif %}
+        <a class="bv-btn" href="{{ url_for('preferences') }}">设置页</a>
+      </div>
+    </div>
+    <div id="bv-status" class="bv-status">正在连接服务器浏览器并打开验证页面…</div>
+  </div>
+
+  <div class="bv-card">
+    <div class="bv-toolbar">
+      <button type="button" class="bv-btn bv-btn-primary" id="bv-start">重新打开验证页</button>
+      <button type="button" class="bv-btn" id="bv-refresh">刷新画面</button>
+      <button type="button" class="bv-btn" id="bv-scroll-up">上滚</button>
+      <button type="button" class="bv-btn" id="bv-scroll-down">下滚</button>
+      <button type="button" class="bv-btn bv-btn-success" id="bv-complete">保存状态并完成验证</button>
+      <button type="button" class="bv-btn" id="bv-close">关闭会话</button>
+    </div>
+
+    <div class="bv-toolbar">
+      <input type="text" id="bv-text" class="bv-input-text" placeholder="需要输入文字时在此填写后点击发送…">
+      <button type="button" class="bv-btn" id="bv-send-text">发送文本</button>
+      <button type="button" class="bv-btn" data-key="Enter">Enter</button>
+      <button type="button" class="bv-btn" data-key="Backspace">Backspace</button>
+      <button type="button" class="bv-btn" data-key="Tab">Tab</button>
+      <button type="button" class="bv-btn" data-key="Escape">Esc</button>
+    </div>
+
+    <div class="bv-viewport-box">
+      <img id="bv-screen" class="bv-screen" alt="服务器浏览器实时画面" width="1280" height="800">
+      <div id="bv-placeholder" class="bv-placeholder">正在加载服务器浏览器画面…</div>
+    </div>
+    <p class="bv-hint">提示：直接点击画面中的“我不是机器人”选框或图片验证码即可操作服务器上的浏览器。验证通过后会自动保存 Cookie/状态并恢复搜索。</p>
+  </div>
+</div>
+
+<script>
+(() => {
+  const ENGINE = {{ verify_engine|tojson }};
+  const URLS = {
+    status: {{ url_for('browser_verify_status')|tojson }},
+    start: {{ url_for('browser_verify_start')|tojson }},
+    frame: {{ url_for('browser_verify_frame')|tojson }},
+    input: {{ url_for('browser_verify_input')|tojson }},
+    complete: {{ url_for('browser_verify_complete')|tojson }},
+    close: {{ url_for('browser_verify_close')|tojson }},
+  };
+
+  const screenEl = document.getElementById('bv-screen');
+  const placeholderEl = document.getElementById('bv-placeholder');
+  const statusEl = document.getElementById('bv-status');
+  const textEl = document.getElementById('bv-text');
+
+  let active = false;
+  let frameBusy = false;
+  let inputBusy = false;
+  let lastObjectUrl = null;
+  let pollTimer = null;
+
+  function setStatus(text, kind) {
+    statusEl.textContent = text;
+    statusEl.className = 'bv-status' + (kind ? ' ' + kind : '');
+  }
+
+  function renderStatus(data) {
+    if (!data || !data.ok) {
+      setStatus('状态异常：' + ((data && data.reason) || '未知错误'), 'is-error');
+      return;
+    }
+    active = Boolean(data.active);
+    if (data.solved) {
+      active = false;
+      setStatus(
+        '验证已通过并保存状态（' + (data.route || 'direct') + '），服务器验证页面将自动关闭。' +
+        (data.current_url ? ' 当前页：' + data.current_url : ''),
+        'is-solved'
+      );
+    } else if (active) {
+      const reasonText = data.reason ? '（触发原因：' + data.reason + '）' : '';
+      setStatus(
+        '等待手动完成验证' + reasonText +
+        (data.current_url ? ' — 当前页：' + data.current_url : ''),
+        ''
+      );
+    } else {
+      setStatus('当前没有活动的验证会话，点击“重新打开验证页”即可启动。', '');
+    }
+  }
+
+  async function postJson(url, body) {
+    const resp = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body || {}),
+    });
+    return await resp.json();
+  }
+
+  async function fetchFrame(force) {
+    if (!active || frameBusy) return;
+    frameBusy = true;
+    try {
+      const resp = await fetch(
+        URLS.frame + '?engine=' + encodeURIComponent(ENGINE) + (force ? '&force=1' : '') + '&t=' + Date.now(),
+        { cache: 'no-store' }
+      );
+      if (resp.status === 409) {
+        active = false;
+        placeholderEl.style.display = 'flex';
+        placeholderEl.textContent = '验证会话已关闭';
+        return;
+      }
+      if (!resp.ok) return;
+      const blob = await resp.blob();
+      const nextUrl = URL.createObjectURL(blob);
+      screenEl.src = nextUrl;
+      placeholderEl.style.display = 'none';
+      if (lastObjectUrl) URL.revokeObjectURL(lastObjectUrl);
+      lastObjectUrl = nextUrl;
+      if (resp.headers.get('X-Verify-Solved') === '1') {
+        await refreshStatus();
+      }
+    } catch (_) {
+    } finally {
+      frameBusy = false;
+    }
+  }
+
+  async function refreshStatus() {
+    try {
+      const resp = await fetch(
+        URLS.status + '?engine=' + encodeURIComponent(ENGINE) + '&t=' + Date.now(),
+        { cache: 'no-store' }
+      );
+      const data = await resp.json();
+      renderStatus(data);
+    } catch (err) {
+      setStatus('获取验证状态失败：' + err, 'is-error');
+    }
+  }
+
+  async function startSession(forceNew) {
+    setStatus('正在打开服务器浏览器页面…', '');
+    placeholderEl.style.display = 'flex';
+    placeholderEl.textContent = '正在打开目标页面…';
+    try {
+      const data = await postJson(URLS.start, { engine: ENGINE, force_new: Boolean(forceNew) });
+      renderStatus(data);
+      if (data && data.ok && data.active) {
+        await fetchFrame(true);
+      }
+    } catch (err) {
+      setStatus('启动验证失败：' + err, 'is-error');
+    }
+  }
+
+  async function sendInput(payload) {
+    if (!active || inputBusy) return;
+    inputBusy = true;
+    try {
+      const data = await postJson(URLS.input, Object.assign({ engine: ENGINE }, payload));
+      renderStatus(data);
+      await fetchFrame(true);
+    } catch (err) {
+      setStatus('发送操作失败：' + err, 'is-error');
+    } finally {
+      inputBusy = false;
+    }
+  }
+
+  screenEl.addEventListener('click', (ev) => {
+    if (!active) return;
+    const rect = screenEl.getBoundingClientRect();
+    if (!rect.width || !rect.height) return;
+    const x = Math.round(((ev.clientX - rect.left) / rect.width) * 1280);
+    const y = Math.round(((ev.clientY - rect.top) / rect.height) * 800);
+    sendInput({ kind: 'click', x, y, button: 'left', click_count: 1 });
+  });
+
+  screenEl.addEventListener('wheel', (ev) => {
+    if (!active) return;
+    ev.preventDefault();
+    sendInput({ kind: 'wheel', delta_x: ev.deltaX || 0, delta_y: ev.deltaY || 0 });
+  }, { passive: false });
+
+  document.getElementById('bv-start').addEventListener('click', () => startSession(true));
+  document.getElementById('bv-refresh').addEventListener('click', async () => {
+    await refreshStatus();
+    await fetchFrame(true);
+  });
+  document.getElementById('bv-scroll-up').addEventListener('click', () => sendInput({ kind: 'wheel', delta_x: 0, delta_y: -360 }));
+  document.getElementById('bv-scroll-down').addEventListener('click', () => sendInput({ kind: 'wheel', delta_x: 0, delta_y: 360 }));
+
+  document.getElementById('bv-complete').addEventListener('click', async () => {
+    try {
+      const data = await postJson(URLS.complete, { engine: ENGINE, close_session: true });
+      renderStatus(data);
+      active = false;
+      placeholderEl.style.display = 'flex';
+      placeholderEl.textContent = '已保存验证状态，可以返回搜索了';
+    } catch (err) {
+      setStatus('保存验证状态失败：' + err, 'is-error');
+    }
+  });
+
+  document.getElementById('bv-close').addEventListener('click', async () => {
+    try {
+      const data = await postJson(URLS.close, {});
+      renderStatus(data);
+      active = false;
+      placeholderEl.style.display = 'flex';
+      placeholderEl.textContent = '验证会话已关闭';
+    } catch (err) {
+      setStatus('关闭会话失败：' + err, 'is-error');
+    }
+  });
+
+  document.getElementById('bv-send-text').addEventListener('click', () => {
+    const val = textEl.value;
+    if (!val) return;
+    textEl.value = '';
+    sendInput({ kind: 'type', text: val });
+  });
+
+  document.querySelectorAll('[data-key]').forEach((btn) => {
+    btn.addEventListener('click', () => sendInput({ kind: 'press', key: btn.dataset.key }));
+  });
+
+  let tickCount = 0;
+  function scheduleLoop() {
+    if (pollTimer) clearTimeout(pollTimer);
+    pollTimer = setTimeout(async () => {
+      if (!document.hidden && active) {
+        tickCount += 1;
+        await fetchFrame(false);
+        if (tickCount % 5 === 0) {
+          await refreshStatus();
+        }
+      }
+      scheduleLoop();
+    }, 300);
+  }
+
+  window.addEventListener('pagehide', () => {
+    if (active && navigator.sendBeacon) {
+      navigator.sendBeacon(URLS.close, new Blob(['{}'], { type: 'application/json' }));
+    }
+  });
+
+  (async () => {
+    await startSession(false);
+    scheduleLoop();
+  })();
+})();
+</script>
+{% endblock %}

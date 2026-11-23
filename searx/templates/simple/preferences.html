@@ -346,6 +346,7 @@
           {% if server_config.google_auth.configured %}
             <button type="submit" name="action" value="clear">清除 Google 登录态</button>
           {% endif %}
+          <a href="{{ url_for('browser_verify', engine='google') }}" style="margin-left: 0.75rem;">打开网页验证（手动过验证码）</a>
         </p>
       </fieldset>
     </form>

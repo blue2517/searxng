@@ -15,7 +15,16 @@
              {{- engine_name -}}
           </a>
         </td>
-        <td class="response-error">{{- error_type -}}</td>
+        <td class="response-error">
+          {{- error_type -}}
+          {% if browser_verify_alerts %}
+            {% for alert in browser_verify_alerts %}
+              {% if alert.engine_name == engine_name %}
+                (<a href="{{ alert.verify_url }}">网页验证</a>)
+              {% endif %}
+            {% endfor %}
+          {% endif %}
+        </td>
       </tr>
       {%- endfor -%}
       {%- for engine_name, response_time in timings -%}

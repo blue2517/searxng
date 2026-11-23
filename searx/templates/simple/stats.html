@@ -16,6 +16,13 @@
 {% block content %}
 <h1>{% if selected_engine_name %}<a href="{{ url_for('stats') }}">{% endif %}{{ _('Engine stats') }}{% if selected_engine_name %}</a> - {{ selected_engine_name }}{% endif %}</h1>
 
+{% if browser_verify_url %}
+<div class="dialog-error-block" style="margin: 0.75rem 0;">
+  若该引擎因验证码 / 人机验证失败，可点击手动打开服务器浏览器页面完成验证：
+  <a href="{{ browser_verify_url }}"><strong>打开网页验证</strong></a>
+</div>
+{% endif %}
+
 {% if not engine_stats.get('time') %}
 {{ _('There is currently no data available. ') }}
 {% else %}

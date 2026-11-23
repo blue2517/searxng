@@ -222,11 +222,6 @@ def save(form: Any) -> dict[str, Any]:
     user_cfg = _load_user_settings(path)
     user_cfg["engines"] = _engine_overrides(enabled_names, user_cfg.get("engines"))
     user_cfg.setdefault("outgoing", {})["proxy_pool"] = proxy_pool
-    browser_cfg = user_cfg.get("browser_search")
-    if isinstance(browser_cfg, dict):
-        browser_cfg.pop("enabled", None)
-        if not browser_cfg:
-            user_cfg.pop("browser_search", None)
     _write_yaml(path, user_cfg)
 
     # Apply the same effective values to this process.  A service manager still
