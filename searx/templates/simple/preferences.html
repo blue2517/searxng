@@ -283,24 +283,16 @@
       </fieldset>
 
       <fieldset>
-        <legend>HTTP 搜索代理池</legend>
+        <legend>搜索代理</legend>
         <label class="server-setting-row">
           <input type="checkbox" name="http_proxy_pool_enabled" {% if server_config.proxy_pool.enabled %}checked{% endif %}>
-          遇到风控后使用代理池
-        </label>
-        <label class="server-setting-row">
-          最大尝试次数
-          <select name="http_proxy_pool_max_attempts">
-            {% for attempts in [1, 2, 3] %}
-              <option value="{{ attempts }}" {% if attempts == server_config.proxy_pool.max_attempts %}selected{% endif %}>{{ attempts }}</option>
-            {% endfor %}
-          </select>
+          启用代理（启用后所有搜索固定使用该代理；不启用则固定直连，不自动切换或降级）
         </label>
         <label class="server-setting-block">
           代理地址
-          <textarea name="http_proxy_pool_entries" rows="5" spellcheck="false">{{ server_config.proxy_pool.entries | join('\n') }}</textarea>
+          <input type="text" name="http_proxy_pool_entries" value="{{ server_config.proxy_pool.proxy }}" placeholder="例如 socks5://host:port 或 http://user:pass@host:port" spellcheck="false" style="width: 100%; box-sizing: border-box;">
         </label>
-        <p class="description">每行一个 HTTP、HTTPS、SOCKS4、SOCKS5 或 SOCKS5H 代理地址。每次搜索先使用直连。</p>
+        <p class="description">填写单个 HTTP、HTTPS、SOCKS4、SOCKS5 或 SOCKS5H 代理地址。修改并保存后将立即应用到 HTTP 搜索和浏览器搜索服务。</p>
       </fieldset>
 
       <input type="submit" value="保存服务器配置">
@@ -308,45 +300,38 @@
 
     <form method="post" action="{{ url_for('save_server_google_auth') }}" autocomplete="off">
       <fieldset>
-        <legend>Google 浏览器搜索登录态</legend>
-        {% if google_auth_saved %}
-          <p class="dialog-success-block">Google 登录态已导入并通知浏览器搜索服务生效。</p>
-        {% endif %}
+        <legend>Google 浏览器搜索账号登录</legend>
         {% if google_auth_cleared %}
-          <p class="dialog-success-block">Google 登录态已清除。</p>
+          <p class="dialog-success-block">Google 登录会话已清除。</p>
         {% endif %}
         {% if google_auth_error %}
-          <p class="dialog-error-block">Google 登录态更新失败：{{ google_auth_error }}</p>
+          <p class="dialog-error-block">操作失败：{{ google_auth_error }}</p>
         {% endif %}
         <p class="server-setting-row">
-          当前状态：
-          {% if server_config.google_auth.configured %}
-            <strong>已导入（{{ server_config.google_auth.cookie_count }} 个 Cookie）</strong>
-            {% if server_config.google_auth.last_auth_ok is sameas true %}
-              — 最近一次搜索校验：<strong>已登录</strong>
-            {% elif server_config.google_auth.last_auth_ok is sameas false %}
-              — 最近一次搜索校验：<strong>登录态可能已失效（{{ server_config.google_auth.last_reason }}）</strong>
-            {% else %}
-              — 尚未执行搜索校验
-            {% endif %}
-            {% if server_config.google_auth.updated_at %}
-              （更新于 {{ server_config.google_auth.updated_at }}）
-            {% endif %}
+          当前出口路由：<strong>{{ '直连 (direct)' if server_config.google_auth.route == 'direct' else server_config.google_auth.route }}</strong>
+        </p>
+        <p class="server-setting-row">
+          当前登录状态：
+          {% if server_config.google_auth.logged_in is sameas true %}
+            <strong>已登录</strong>
+          {% elif server_config.google_auth.logged_in is sameas false %}
+            <strong>登录已失效（{{ server_config.google_auth.reason or 'session_logged_out' }}）</strong>
+          {% elif server_config.google_auth.has_auth_cookies %}
+            <strong>已保存登录会话（待搜索验证）</strong>
           {% else %}
-            <strong>未导入（当前为匿名搜索）</strong>
+            <strong>未登录（当前为匿名搜索）</strong>
+          {% endif %}
+          {% if server_config.google_auth.updated_at %}
+            （更新于 {{ server_config.google_auth.updated_at }}）
           {% endif %}
         </p>
-        <label class="server-setting-block">
-          导入 Google Cookies
-          <textarea name="google_auth_cookies" rows="5" spellcheck="false" placeholder="支持直接粘贴 HTTP Cookie: 请求头字符串、Cookie-Editor JSON、Netscape cookies.txt 或 Playwright storage_state.json（不回显已保存内容）"></textarea>
-        </label>
-        <p class="description">建议使用专用 Google 小号在无痕窗口登录后导出完整 Cookie 并关闭窗口（不要点退出登录）。</p>
+        <p class="description">直接在服务器浏览器中登录专用 Google 账号，登录态将绑定当前固定出口并由浏览器原生维持，不再通过粘贴 Cookie 导入。</p>
         <p class="server-setting-row">
-          <button type="submit" name="action" value="import">导入 / 更新 Google 登录态</button>
-          {% if server_config.google_auth.configured %}
-            <button type="submit" name="action" value="clear">清除 Google 登录态</button>
-          {% endif %}
+          <a href="{{ url_for('browser_verify', engine='google', mode='login') }}">打开浏览器登录 Google 账号</a>
           <a href="{{ url_for('browser_verify', engine='google') }}" style="margin-left: 0.75rem;">打开网页验证（手动过验证码）</a>
+          {% if server_config.google_auth.has_session or server_config.google_auth.has_auth_cookies %}
+            <button type="submit" name="action" value="clear" style="margin-left: 0.75rem;">退出登录并清除会话</button>
+          {% endif %}
         </p>
       </fieldset>
     </form>

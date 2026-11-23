@@ -218,11 +218,11 @@ outgoing:
   #    - 1.1.1.2
   #    - fe80::/126
 
-  # Optional HTTP engine recovery pool. The direct request is attempted first;
-  # a challenge or proxy failure rotates to another entry, up to three attempts.
+  # Optional single proxy for HTTP searches (and shared with browser search).
+  # When enabled with a valid entry, all non-loopback requests use that proxy;
+  # when disabled, all requests connect directly without fallback or rotation.
   proxy_pool:
     enabled: false
-    max_attempts: 3
     entries: []
 
 # Optional server-side browser search worker. It is disabled by default.
@@ -232,8 +232,6 @@ browser_search:
   port: 8890
   endpoint: "http://127.0.0.1:8890"
   profile_dir: "/var/lib/searxng/browser-profiles"
-  google_auth_state_file: ""
-  persist_google_auth: true
   headless: true
   # Keep browser contexts warm so the first search does not pay Chrome startup cost.
   prewarm: true
@@ -252,12 +250,6 @@ browser_search:
   user_agent: ""
   navigation_timeout: 30
   selector_timeout: 3
-  # Maximum time spent looking for a consent button when it is not cached.
-  consent_timeout: 800
-  # Delay before recreating a challenged route Context (0-10s).
-  challenge_retry_delay: 2
-  # Context recreations after a challenge, kept separate from route attempts.
-  recovery_retries_per_route: 1
   # Direct route plus at most this many proxy routes.
   max_route_attempts: 3
   # Cool down a challenged route before a later queued search (0-10s).

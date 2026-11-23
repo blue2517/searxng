@@ -12,13 +12,6 @@ from typing import Any
 from socketserver import ThreadingMixIn
 from urllib.parse import parse_qs, urlsplit
 
-from .auth_state import (
-    clear_google_auth_state,
-    get_google_auth_status,
-    parse_google_cookies_input,
-    resolve_google_auth_path,
-    save_google_auth_state,
-)
 from .manager import BrowserSearchDispatcher, SearchRequest
 
 logger = logging.getLogger(__name__)
@@ -35,7 +28,6 @@ def _config() -> dict[str, Any]:
             config["proxy_pool"] = {
                 "enabled": bool(outgoing_pp.get("enabled", False)),
                 "entries": list(outgoing_pp.get("entries", [])),
-                "max_attempts": outgoing_pp.get("max_attempts", 3),
             }
     return config
 
@@ -92,8 +84,11 @@ class BrowserSearchHandler(BaseHTTPRequestHandler):
             self._send(200, {"ok": True, "service": "browser-search"})
             return
         if path == "/v1/auth/google":
-            auth_path = resolve_google_auth_path(self.server.manager.config)
-            self._send(200, {"ok": True, **get_google_auth_status(auth_path)})
+            try:
+                self._send(200, {"ok": True, **self.server.manager.google_login_status()})
+            except Exception as exc:  # pragma: no cover - service boundary
+                logger.exception("google login status failed")
+                self._send(500, {"ok": False, "status": "error", "reason": str(exc)})
             return
         if path == "/v1/verify/status":
             engine = (params.get("engine") or ["google"])[0]
@@ -133,33 +128,20 @@ class BrowserSearchHandler(BaseHTTPRequestHandler):
         path = urlsplit(self.path).path
         if path == "/v1/auth/google":
             try:
-                payload = self._read_json_body(max_bytes=512 * 1024)
-                if not payload:
-                    raise ValueError("invalid request body size")
-                auth_path = resolve_google_auth_path(self.server.manager.config)
-                action = str(payload.get("action", "import")).strip().lower()
+                payload = self._read_json_body()
+                action = str(payload.get("action", "")).strip().lower()
                 if action == "clear":
-                    clear_google_auth_state(auth_path)
-                    status = self.server.manager.reload_google_auth(
-                        clear_route_states=True
-                    )
+                    status = self.server.manager.clear_google_session()
                     self._send(200, {"ok": True, **status})
                     return
-                if action == "reload":
-                    status = self.server.manager.reload_google_auth(
-                        clear_route_states=bool(payload.get("clear_route_states", False))
-                    )
-                    self._send(200, {"ok": True, **status})
-                    return
-                raw = str(payload.get("raw", ""))
-                state, source_format = parse_google_cookies_input(
-                    raw, require_auth_cookies=True
+                self._send(
+                    400,
+                    {
+                        "ok": False,
+                        "status": "invalid_request",
+                        "reason": "cookie import is removed; use interactive browser login",
+                    },
                 )
-                save_google_auth_state(auth_path, state, source_format=source_format)
-                status = self.server.manager.reload_google_auth(
-                    clear_route_states=False
-                )
-                self._send(200, {"ok": True, **status})
                 return
             except (ValueError, TypeError, json.JSONDecodeError) as exc:
                 self._send(
@@ -170,14 +152,31 @@ class BrowserSearchHandler(BaseHTTPRequestHandler):
                 logger.exception("google auth update failed")
                 self._send(500, {"ok": False, "status": "error", "reason": str(exc)})
                 return
+        if path == "/v1/config/reload":
+            try:
+                payload = self._read_json_body()
+                proxy_cfg = payload.get("proxy_pool")
+                if not isinstance(proxy_cfg, dict):
+                    proxy_cfg = {}
+                result = self.server.manager.reload_proxy_config(proxy_cfg)
+                self._send(200, result)
+            except (ValueError, TypeError, json.JSONDecodeError) as exc:
+                self._send(
+                    400, {"ok": False, "status": "invalid_request", "reason": str(exc)}
+                )
+            except Exception as exc:  # pragma: no cover - service boundary
+                logger.exception("browser config reload failed")
+                self._send(500, {"ok": False, "status": "error", "reason": str(exc)})
+            return
         if path == "/v1/verify/start":
             try:
                 payload = self._read_json_body()
                 engine = str(payload.get("engine", "google")).strip().lower()
                 url = str(payload.get("url", "")).strip() or None
                 force_new = bool(payload.get("force_new", False))
+                mode = str(payload.get("mode", "verify")).strip().lower()
                 status = self.server.manager.verify_start(
-                    engine=engine, url=url, force_new=force_new
+                    engine=engine, url=url, force_new=force_new, mode=mode
                 )
                 self._send(200 if status.get("ok") else 400, status)
             except (ValueError, TypeError, json.JSONDecodeError) as exc:

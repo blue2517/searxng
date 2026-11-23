@@ -1042,26 +1042,19 @@ def save_server_preferences():
 
 @app.route('/preferences/server/google-auth', methods=['POST'])
 def save_server_google_auth():
-    """Import or clear persisted Google search cookies for the browser worker."""
+    """Clear persisted Google browser login session for the browser worker."""
 
     if not settings['server'].get('auth_username') or not settings['server'].get('auth_password'):
         return Response('Server settings require HTTP Basic Auth', status=403, mimetype='text/plain')
-    action = str(sxng_request.form.get('action', 'import')).strip().lower()
-    if action == 'clear':
-        try:
-            server_config.clear_google_auth()
-        except (OSError, RuntimeError, ValueError) as exc:
-            logger.exception("failed to clear Google auth state")
-            return redirect(url_for('preferences', google_auth_error=str(exc)))
-        return redirect(url_for('preferences', google_auth_cleared='1'))
-
-    raw_cookies = str(sxng_request.form.get('google_auth_cookies', ''))
+    action = str(sxng_request.form.get('action', 'clear')).strip().lower()
+    if action != 'clear':
+        return redirect(url_for('preferences', google_auth_error='已移除 Cookie 导入，请直接通过浏览器登录 Google 账号'))
     try:
-        server_config.import_google_auth(raw_cookies)
+        server_config.clear_google_auth()
     except (OSError, RuntimeError, ValueError) as exc:
-        logger.warning("failed to import Google auth cookies: %s", exc)
+        logger.exception("failed to clear Google login session")
         return redirect(url_for('preferences', google_auth_error=str(exc)))
-    return redirect(url_for('preferences', google_auth_saved='1'))
+    return redirect(url_for('preferences', google_auth_cleared='1'))
 
 
 _BROWSER_ENGINE_KEYS = {
@@ -1155,17 +1148,20 @@ def _proxy_worker_json(method: str, path: str, *, params=None, json_body=None, t
 
 @app.route('/browser-verify', methods=['GET'])
 def browser_verify():
-    """Interactive remote browser verification page for human CAPTCHA completion."""
+    """Interactive remote browser page for manual verification or Google sign-in."""
 
     allowed, err_resp = _browser_verify_allowed()
     if not allowed:
         return err_resp
     engine_key = _normalize_browser_engine_key(sxng_request.args.get('engine'))
+    raw_mode = str(sxng_request.args.get('mode', 'verify')).strip().lower()
+    verify_mode = 'login' if engine_key == 'google' and raw_mode == 'login' else 'verify'
     query = str(sxng_request.args.get('q', '')).strip()
     return render(
         'browser_verify.html',
         verify_engine=engine_key,
         verify_engine_name=_BROWSER_KEY_ENGINES[engine_key],
+        verify_mode=verify_mode,
         verify_query=query,
     )
 
@@ -1193,8 +1189,11 @@ def browser_verify_start():
         return err_resp
     payload = sxng_request.get_json(silent=True) or {}
     engine_key = _normalize_browser_engine_key(payload.get('engine'))
+    raw_mode = str(payload.get('mode', 'verify')).strip().lower()
+    mode = 'login' if engine_key == 'google' and raw_mode == 'login' else 'verify'
     body = {
         'engine': engine_key,
+        'mode': mode,
         'force_new': bool(payload.get('force_new', False)),
     }
     if payload.get('url'):

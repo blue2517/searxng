@@ -36,16 +36,18 @@ class ProxyPoolTests(TestCase):
             proxy.playwright_config(),
         )
 
-    def test_round_rotates_and_uses_each_entry_once(self):
+    def test_parse_proxy_supports_socks5h(self):
+        proxy = ProxyEndpoint.parse(0, "socks5h://example.test:1080")
+        self.assertEqual("socks5", proxy.scheme)
+        self.assertEqual("socks5://example.test:1080", proxy.display_name)
+
+    def test_primary_proxy_is_fixed_without_rotation(self):
         pool = ProxyPool(
             ["socks5://a.test:1", "socks5://b.test:2", "socks5://c.test:3"]
         )
-        self.assertEqual(
-            ["a.test", "b.test", "c.test"], [item.host for item in pool.round()]
-        )
-        self.assertEqual(
-            ["b.test", "c.test", "a.test"], [item.host for item in pool.round()]
-        )
+        self.assertEqual("a.test", pool.primary.host)
+        self.assertEqual(["a.test"], [item.host for item in pool.round()])
+        self.assertEqual(["a.test"], [item.host for item in pool.round()])
 
 
 class BrowserManagerTests(IsolatedAsyncioTestCase):
@@ -87,7 +89,7 @@ class BrowserManagerTests(IsolatedAsyncioTestCase):
         self.assertIn(
             "q=%E5%8D%A1%E8%8E%B2+%E5%A5%A5%E5%B0%94%E9%BB%9B%E8%A5%BF%E4%BA%9A", url
         )
-        self.assertIn("gl=us", url)
+        self.assertIn("gl=hk", url)
         self.assertIn("hl=zh-CN", url)
         self.assertIn("start=10", url)
         self.assertIn("safe=active", url)
@@ -139,26 +141,21 @@ class BrowserManagerTests(IsolatedAsyncioTestCase):
             manager._context_key(route, "en-US"),
         )
 
-    async def test_force_clean_context_does_not_seed_last_good_state(self):
+    async def test_create_context_loads_existing_route_state_directly(self):
         manager = BrowserSearchManager({"profile_dir": "unused"})
-        # Use a temporary profile without relying on a running Playwright browser.
         manager.profile_root = Path(tempfile.mkdtemp())
         manager._browser = Mock()
         manager._browser.new_context = AsyncMock(return_value=Mock())
         manager._browser.new_context.return_value.add_init_script = AsyncMock()
-        manager._direct_context = Mock()
-        manager._direct_context.storage_state = AsyncMock()
         route = Route("direct", "direct")
         key = manager._context_key(route, "en-US")
-        manager._state_path(key).write_text("{}", encoding="utf-8")
-        manager._force_clean_context.add(key)
+        state_path = manager._state_path(key)
+        state_path.write_text('{"cookies": [], "origins": []}', encoding="utf-8")
 
         await manager._create_context(route, "en-US", key)
 
         kwargs = manager._browser.new_context.await_args.kwargs
-        self.assertNotIn("storage_state", kwargs)
-        manager._direct_context.storage_state.assert_not_awaited()
-        self.assertNotIn(key, manager._force_clean_context)
+        self.assertEqual(str(state_path), kwargs["storage_state"])
 
     async def test_block_reason_detects_javascript_page(self):
         page = Mock()
@@ -212,51 +209,34 @@ class BrowserManagerTests(IsolatedAsyncioTestCase):
         self.assertEqual("https://example.test", results[0]["url"])
         page.evaluate.assert_called_once()
 
-    def test_challenge_retry_delay_is_bounded(self):
-        self.assertEqual(
-            10,
-            BrowserSearchManager({"challenge_retry_delay": 99}).challenge_retry_delay,
-        )
-        self.assertEqual(
-            0, BrowserSearchManager({"challenge_retry_delay": -1}).challenge_retry_delay
-        )
-
-    async def test_search_recreates_context_before_challenge_recovery(self):
+    async def test_search_uses_direct_once_when_proxy_disabled(self):
         manager = BrowserSearchManager(
-            {"profile_dir": "unused", "max_attempts": 3, "challenge_retry_delay": 0}
+            {
+                "profile_dir": "unused",
+                "proxy_pool": {
+                    "enabled": False,
+                    "entries": ["socks5://a.test:1080"],
+                },
+            }
         )
         manager.start = AsyncMock()
-        manager._close_route = AsyncMock()
         manager._perform = AsyncMock(
-            side_effect=[
-                {"ok": False, "status": "blocked", "reason": "captcha"},
-                {"ok": True, "status": "ok", "results": []},
-            ]
+            return_value={"ok": False, "status": "blocked", "reason": "captcha"}
         )
 
         result = await manager.search(SearchRequest("test"))
 
-        self.assertTrue(result["ok"])
-        self.assertEqual(2, result["attempts"])
-        self.assertEqual(2, manager._perform.call_count)
-        self.assertEqual(
-            [call.args[1].name for call in manager._perform.call_args_list],
-            ["direct", "direct"],
-        )
-        manager._close_route.assert_awaited_once_with(
-            Route("direct", "direct"),
-            clear_cookies=False,
-            engine="google",
-            locale="en-US",
-            reason="challenge_before_recovery",
-        )
+        self.assertFalse(result["ok"])
+        self.assertEqual(1, result["attempts"])
+        self.assertEqual(1, result["routes_tried"])
+        self.assertEqual(0, result["recoveries"])
+        manager._perform.assert_awaited_once()
+        self.assertEqual("direct", manager._perform.await_args.args[1].name)
 
-    async def test_search_retries_direct_then_rotates_proxy(self):
+    async def test_search_uses_configured_proxy_once_when_enabled(self):
         manager = BrowserSearchManager(
             {
                 "profile_dir": "unused",
-                "max_attempts": 5,
-                "challenge_retry_delay": 0,
                 "proxy_pool": {
                     "enabled": True,
                     "entries": ["socks5://a.test:1080", "socks5://b.test:1080"],
@@ -264,99 +244,23 @@ class BrowserManagerTests(IsolatedAsyncioTestCase):
             }
         )
         manager.start = AsyncMock()
-        manager._close_route = AsyncMock()
         manager._perform = AsyncMock(
-            side_effect=[
-                {"ok": False, "status": "blocked", "reason": "captcha"},
-                {"ok": False, "status": "blocked", "reason": "captcha"},
-                {"ok": False, "status": "blocked", "reason": "captcha"},
-                {"ok": False, "status": "blocked", "reason": "captcha"},
-                {"ok": True, "status": "ok", "results": []},
-            ]
-        )
-        result = await manager.search(SearchRequest("test"))
-        self.assertTrue(result["ok"])
-        self.assertEqual(5, result["attempts"])
-        self.assertEqual(5, manager._perform.call_count)
-        routes = [call.args[1].name for call in manager._perform.call_args_list]
-        self.assertEqual(
-            [
-                "direct",
-                "direct",
-                "socks5://a.test:1080",
-                "socks5://a.test:1080",
-                "socks5://b.test:1080",
-            ],
-            routes,
-        )
-        self.assertTrue(manager._close_route.await_count >= 1)
-
-    async def test_search_clears_route_after_rate_limit(self):
-        manager = BrowserSearchManager(
-            {
-                "profile_dir": "unused",
-                "max_attempts": 2,
-                "proxy_pool": {
-                    "enabled": True,
-                    "entries": ["socks5://a.test:1080"],
-                },
-            }
-        )
-        manager.start = AsyncMock()
-        manager._close_route = AsyncMock()
-        manager._perform = AsyncMock(
-            side_effect=[
-                {"ok": False, "status": "rate_limited", "reason": "http_429"},
-                {"ok": True, "status": "ok", "results": []},
-            ]
-        )
-        result = await manager.search(SearchRequest("test"))
-        self.assertTrue(result["ok"])
-        self.assertEqual(2, result["attempts"])
-        self.assertTrue(manager._close_route.await_count >= 1)
-        first_close = manager._close_route.await_args_list[0]
-        self.assertTrue(first_close.kwargs["clear_cookies"])
-        self.assertEqual("route_failure", first_close.kwargs["reason"])
-
-    async def test_browser_configuration_failure_does_not_rotate_proxy(self):
-        manager = BrowserSearchManager(
-            {
-                "profile_dir": "unused",
-                "max_attempts": 3,
-                "proxy_pool": {
-                    "enabled": True,
-                    "entries": ["socks5://a.test:1080"],
-                },
-            }
-        )
-        manager.start = AsyncMock()
-        manager._close_route = AsyncMock()
-        manager._perform = AsyncMock(
-            return_value={
-                "ok": False,
-                "status": "blocked",
-                "reason": "browser_update_required",
-            }
+            return_value={"ok": False, "status": "blocked", "reason": "captcha"}
         )
 
         result = await manager.search(SearchRequest("test"))
 
         self.assertFalse(result["ok"])
         self.assertEqual(1, result["attempts"])
-        manager._perform.assert_called_once()
-        manager._close_route.assert_awaited_once_with(
-            Route("direct", "direct"),
-            clear_cookies=False,
-            engine="google",
-            locale="en-US",
-            reason="browser_update_required",
-        )
+        self.assertEqual(1, result["routes_tried"])
+        self.assertEqual(0, result["recoveries"])
+        manager._perform.assert_awaited_once()
+        self.assertEqual("socks5://a.test:1080", manager._perform.await_args.args[1].name)
 
-    async def test_transport_error_rotates_after_clean_context_reset(self):
+    async def test_warm_uses_active_route(self):
         manager = BrowserSearchManager(
             {
                 "profile_dir": "unused",
-                "max_attempts": 2,
                 "proxy_pool": {
                     "enabled": True,
                     "entries": ["socks5://a.test:1080"],
@@ -364,33 +268,27 @@ class BrowserManagerTests(IsolatedAsyncioTestCase):
             }
         )
         manager.start = AsyncMock()
-        manager._close_route = AsyncMock()
-        manager._perform = AsyncMock(
-            side_effect=[
-                {
-                    "ok": False,
-                    "status": "route_error",
-                    "reason": "transport_error",
-                },
-                {"ok": True, "status": "ok", "results": []},
-            ]
+        manager._context = AsyncMock(return_value=("google-proxy", Mock()))
+
+        await manager.warm("zh-CN")
+
+        self.assertEqual("socks5://a.test:1080", manager._context.await_args.args[0].name)
+
+    async def test_reload_proxy_config_switches_route_and_closes_old_contexts(self):
+        manager = BrowserSearchManager({"profile_dir": "unused"})
+        manager._context_lock = asyncio.Lock()
+        fake_ctx = AsyncMock()
+        manager._contexts["google-direct"] = fake_ctx
+        manager._context_active_pages["google-direct"] = 0
+
+        res = await manager.reload_proxy_config(
+            {"enabled": True, "entries": ["socks5://a.test:1080"]}
         )
 
-        result = await manager.search(SearchRequest("test"))
-
-        self.assertTrue(result["ok"])
-        self.assertEqual(2, result["attempts"])
-        self.assertEqual(
-            [call.args[1].name for call in manager._perform.call_args_list],
-            ["direct", "socks5://a.test:1080"],
-        )
-        manager._close_route.assert_awaited_once_with(
-            Route("direct", "direct"),
-            clear_cookies=True,
-            engine="google",
-            locale="en-US",
-            reason="route_failure",
-        )
+        self.assertTrue(res["proxy_enabled"])
+        self.assertEqual("socks5://a.test:1080", res["route"])
+        fake_ctx.close.assert_awaited_once()
+        self.assertEqual("socks5://a.test:1080", manager._active_route().name)
 
 
 class BrowserServerTests(TestCase):

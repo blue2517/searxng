@@ -16,15 +16,11 @@ from typing import Any
 from urllib.parse import urlencode, urlparse
 
 from .auth_state import (
-    extract_google_storage_state,
-    get_google_auth_status,
+    clear_route_auth_files,
+    get_route_login_status,
     has_google_auth_cookies,
     is_google_cookie_domain,
-    load_google_auth_state,
-    merge_storage_states,
-    resolve_google_auth_path,
-    save_google_auth_state,
-    update_google_auth_meta,
+    write_route_auth_meta,
 )
 from .proxy_pool import ProxyEndpoint, ProxyPool
 from .socks_bridge import Socks5AuthBridge
@@ -172,8 +168,6 @@ class BrowserSearchManager:
         self.profile_root = Path(
             config.get("profile_dir", "/var/lib/searxng/browser-profiles")
         )
-        self.google_auth_state_path = resolve_google_auth_path(config)
-        self.persist_google_auth = bool(config.get("persist_google_auth", True))
         self.headless = bool(config.get("headless", True))
         self.browser_channel = (
             str(config.get("browser_channel", "chrome")).strip() or None
@@ -184,36 +178,6 @@ class BrowserSearchManager:
         )
         self.selector_timeout = int(float(config.get("selector_timeout", 3)) * 1000)
         self.reuse_context_locale = bool(config.get("reuse_context_locale", True))
-        try:
-            consent_timeout = float(config.get("consent_timeout", 800))
-        except (TypeError, ValueError):
-            consent_timeout = 800.0
-        self.consent_timeout = max(100, min(2000, int(consent_timeout)))
-        # Route attempts and recovery attempts are separate.  The legacy
-        # max_attempts setting remains accepted as the route-attempt fallback.
-        try:
-            configured_routes = int(
-                config.get("max_route_attempts", config.get("max_attempts", 3))
-            )
-        except (TypeError, ValueError):
-            configured_routes = 3
-        self.max_route_attempts = max(1, min(8, configured_routes))
-        self.max_attempts = self.max_route_attempts
-        try:
-            configured_recoveries = int(config.get("recovery_retries_per_route", 1))
-        except (TypeError, ValueError):
-            configured_recoveries = 1
-        self.recovery_retries_per_route = max(0, min(1, configured_recoveries))
-        try:
-            configured_retry_delay = float(config.get("challenge_retry_delay", 2))
-        except (TypeError, ValueError):
-            configured_retry_delay = 2.0
-        self.challenge_retry_delay = max(0.0, min(10.0, configured_retry_delay))
-        try:
-            configured_cooldown = float(config.get("route_cooldown_seconds", 10))
-        except (TypeError, ValueError):
-            configured_cooldown = 10.0
-        self.route_cooldown_seconds = max(0.0, min(10.0, configured_cooldown))
         configured_user_agent = str(config.get("user_agent", "")).strip()
         self.user_agent = configured_user_agent or None
         self._resolved_user_agent = self.user_agent
@@ -228,12 +192,14 @@ class BrowserSearchManager:
                     proxy_config = {
                         "enabled": bool(outgoing_pp.get("enabled", False)),
                         "entries": list(outgoing_pp.get("entries", [])),
-                        "max_attempts": outgoing_pp.get("max_attempts", 3),
                     }
             except Exception:
                 pass
         self.proxy_pool = ProxyPool(proxy_config.get("entries", []))
-        self.proxy_pool_enabled = bool(proxy_config.get("enabled", False))
+        self.proxy_pool_enabled = (
+            bool(proxy_config.get("enabled", False))
+            and self.proxy_pool.primary is not None
+        )
 
         self._playwright: Any = None
         self._browser: Any = None
@@ -242,8 +208,6 @@ class BrowserSearchManager:
         self._context_locales: dict[str, str] = {}
         self._context_active_pages: dict[str, int] = {}
         self._pending_context_close: set[str] = set()
-        self._force_clean_context: set[str] = set()
-        self._route_cooldowns: dict[str, float] = {}
         self._state_locks: dict[str, asyncio.Lock] = {}
         self._context_lock: asyncio.Lock | None = None
         self._start_lock: asyncio.Lock | None = None
@@ -256,6 +220,12 @@ class BrowserSearchManager:
         except (TypeError, ValueError):
             verify_ttl = 300.0
         self._verify_idle_ttl = max(60.0, min(3600.0, verify_ttl))
+
+    def _active_route(self) -> Route:
+        if self.proxy_pool_enabled and self.proxy_pool.primary is not None:
+            proxy = self.proxy_pool.primary
+            return Route(proxy.display_name, proxy.key, proxy)
+        return Route("direct", "direct")
 
     @property
     def browser(self) -> Any:
@@ -400,8 +370,6 @@ class BrowserSearchManager:
         self._context_locales.clear()
         self._context_active_pages.clear()
         self._pending_context_close.clear()
-        self._force_clean_context.clear()
-        self._route_cooldowns.clear()
         for _, context in contexts:
             try:
                 await context.close()
@@ -489,71 +457,20 @@ class BrowserSearchManager:
         kwargs: dict[str, Any] = {
             "locale": norm_locale,
             "viewport": {"width": 1280, "height": 800},
-            "user_agent": self.user_agent or DEFAULT_DESKTOP_UA,
+            "user_agent": self.user_agent
+            or self._resolved_user_agent
+            or DEFAULT_DESKTOP_UA,
         }
         if route.proxy:
             kwargs["proxy"] = self._proxy_config(route.proxy)
         state_path = self._state_path(key)
-        force_clean = key in self._force_clean_context
-        is_google = key.startswith("google")
-        auth_state = (
-            load_google_auth_state(self.google_auth_state_path) if is_google else None
-        )
-        route_state: dict[str, Any] | None = None
-        if state_path.exists() and not force_clean:
-            if auth_state is not None:
-                try:
-                    loaded = json.loads(state_path.read_text(encoding="utf-8"))
-                    if isinstance(loaded, dict):
-                        route_state = loaded
-                except Exception:
-                    route_state = None
-            else:
-                kwargs["storage_state"] = str(state_path)
-        elif (
-            route.profile_key == "direct"
-            and self._direct_context is not None
-            and not force_clean
-        ):
-            # Migrate the existing persistent profile once.  This preserves a
-            # known-good Cookie identity while the search Context remains
-            # replaceable after a challenge.
-            try:
-                await self._direct_context.storage_state(path=str(state_path))
-                if state_path.exists():
-                    if auth_state is not None:
-                        loaded = json.loads(state_path.read_text(encoding="utf-8"))
-                        if isinstance(loaded, dict):
-                            route_state = loaded
-                    else:
-                        kwargs["storage_state"] = str(state_path)
-            except Exception:
-                logger.debug("failed to seed direct storage state", exc_info=True)
-        if auth_state is not None:
-            kwargs["storage_state"] = merge_storage_states(route_state, auth_state)
+        if state_path.exists():
+            kwargs["storage_state"] = str(state_path)
         context = await self._browser.new_context(**kwargs)
         try:
             await context.add_init_script(BROWSER_STEALTH_SCRIPT)
         except Exception:
             logger.debug("failed to install browser stealth script", exc_info=True)
-        if not state_path.exists() and not force_clean and auth_state is None:
-            try:
-                page = await context.new_page()
-                seed_url = (
-                    "https://duckduckgo.com"
-                    if "duckduckgo" in key
-                    else f"https://www.google.com/?hl={norm_locale}"
-                )
-                await page.goto(seed_url, wait_until="domcontentloaded", timeout=5000)
-                await asyncio.sleep(0.8)
-                await page.close()
-                await self._save_state(key, context)
-            except Exception:
-                pass
-        elif auth_state is not None and not state_path.exists():
-            await self._save_state(key, context)
-        if force_clean:
-            self._force_clean_context.discard(key)
         self._context_locales[key] = norm_locale
         self._context_active_pages[key] = 0
         return context
@@ -599,7 +516,7 @@ class BrowserSearchManager:
                   ),
                   hasAccountUi: Boolean(
                     document.querySelector(
-                      'a[href*="SignOutOptions"], a[aria-label*="Google"], a[aria-label*="谷歌账号"], [data-ogsr-up]'
+                      'a[href*="SignOutOptions"], a[aria-label*="Google Account:"], a[aria-label*="Google 账号"], a[aria-label*="Google 帳戶"], a[href*="myaccount.google.com"]'
                     )
                   ),
                 })
@@ -625,84 +542,32 @@ class BrowserSearchManager:
             return False, "session_logged_out"
         if has_account_ui:
             return True, "authenticated"
-        if has_auth_cookie:
+        if has_auth_cookie and not has_login_link:
             if results and not all_goto:
-                return True, "authenticated_direct_urls"
+                return True, "authenticated_cookies"
             if all_goto:
                 return False, "redirect_urls_only"
         return None, "unknown"
 
-    async def _update_google_auth_after_search(
-        self, page: Any, context: Any, results: list[dict[str, str]]
-    ) -> None:
-        if not self.google_auth_state_path.exists():
-            return
-        auth_ok, reason = await self._inspect_google_auth(page, context, results)
-        if auth_ok is True:
-            if self.persist_google_auth:
-                try:
-                    raw_state = await context.storage_state()
-                    if isinstance(raw_state, dict):
-                        google_state = extract_google_storage_state(raw_state)
-                        if has_google_auth_cookies(google_state.get("cookies")):
-                            save_google_auth_state(
-                                self.google_auth_state_path,
-                                google_state,
-                                source_format="refresh",
-                                last_auth_ok=True,
-                                last_reason=reason,
-                            )
-                            return
-                except Exception:
-                    logger.debug(
-                        "failed to refresh google auth state", exc_info=True
-                    )
-            update_google_auth_meta(
-                self.google_auth_state_path, last_auth_ok=True, last_reason=reason
-            )
-        elif auth_ok is False:
-            update_google_auth_meta(
-                self.google_auth_state_path, last_auth_ok=False, last_reason=reason
-            )
-            logger.warning("google-auth-session-expired reason=%s", reason)
-
-    async def _close_route(
+    async def _update_google_login_status(
         self,
+        key: str,
         route: Route,
-        clear_cookies: bool = False,
-        engine: str = "google",
-        locale: str = "en-US",
-        reason: str = "route_reset",
+        page: Any,
+        context: Any,
+        results: list[dict[str, str]],
     ) -> None:
-        """Discard a route Context while preserving its last-good state."""
-
-        key = self._context_key(route, locale, engine)
-        context = self._contexts.get(key)
-        if context is None:
-            if clear_cookies:
-                self._force_clean_context.add(key)
+        auth_ok, reason = await self._inspect_google_auth(page, context, results)
+        if auth_ok is None:
             return
-        active = self._context_active_pages.get(key, 0)
-        if active:
-            if clear_cookies:
-                self._force_clean_context.add(key)
-            self._pending_context_close.add(key)
-            return
-        self._contexts.pop(key, None)
-        self._context_locales.pop(key, None)
-        self._context_active_pages.pop(key, None)
-        if clear_cookies:
-            self._force_clean_context.add(key)
-        try:
-            await context.close()
-        except Exception:
-            logger.debug("failed to close route context %s", key, exc_info=True)
-        logger.info(
-            "browser-search-context-discarded context=%s reason=%s clean_next=%s",
-            key,
-            reason,
-            clear_cookies,
+        write_route_auth_meta(
+            self._state_path(key),
+            logged_in=auth_ok,
+            reason=reason,
+            route=route.name,
         )
+        if auth_ok is False:
+            logger.warning("google-login-session-expired route=%s reason=%s", route.name, reason)
 
     async def _release_page(self, key: str, context: Any, page: Any) -> None:
         try:
@@ -883,40 +748,6 @@ class BrowserSearchManager:
         if snapshot and any(snapshot.get("matches", [])):
             return "captcha"
         return None
-
-    async def _dismiss_consent(self, page: Any) -> bool:
-        try:
-            clicked = await page.evaluate(
-                """
-                () => {
-                  const labels = ['accept all', 'i agree', '同意', '接受全部', '全部接受'];
-                  const nodes = [...document.querySelectorAll('button, [role="button"], [aria-label]')];
-                  const target = nodes.find((node) => {
-                    const value = `${node.innerText || ''} ${node.getAttribute('aria-label') || ''}`.trim().toLowerCase();
-                    return labels.some((label) => value.includes(label));
-                  });
-                  if (!target) return false;
-                  target.click();
-                  return true;
-                }
-                """
-            )
-            if isinstance(clicked, bool) and clicked:
-                return True
-        except Exception:
-            pass
-        try:
-            locator = page.locator(
-                'button:has-text("Accept all"), button:has-text("I agree"), '
-                'button:has-text("同意"), button:has-text("接受全部"), '
-                'button:has-text("全部接受"), [aria-label="Accept all"]'
-            ).first
-            if not await locator.is_visible(timeout=self.consent_timeout):
-                return False
-            await locator.click(timeout=min(1500, self.consent_timeout + 500))
-            return True
-        except Exception:
-            return False
 
     @staticmethod
     async def _wait_for_results(page: Any, engine: str, timeout_ms: int) -> bool:
@@ -1135,7 +966,6 @@ class BrowserSearchManager:
                 "route": route.name,
                 "verify_path": f"/browser-verify?engine={engine}",
             }
-        await self._wait_route_cooldown(request, route)
         key, context = await self._context(route, request.locale, engine)
         _timing_event(request, "context_ready", route=route.name, context_key=key)
         page = await context.new_page()
@@ -1181,22 +1011,6 @@ class BrowserSearchManager:
                 )
 
             reason = await self._block_reason(page, engine)
-            if reason == "consent_required":
-                consent_started_at = time.perf_counter()
-                dismissed = await self._dismiss_consent(page)
-                _timing_event(
-                    request,
-                    "consent_checked",
-                    elapsed_ms=_elapsed_ms(consent_started_at),
-                    dismissed=dismissed,
-                    route=route.name,
-                )
-                if dismissed:
-                    try:
-                        await page.wait_for_load_state("domcontentloaded", timeout=1500)
-                    except Exception:
-                        pass
-                    reason = await self._block_reason(page, engine)
             _timing_event(
                 request, "block_checked", reason=reason or "", route=route.name
             )
@@ -1247,7 +1061,7 @@ class BrowserSearchManager:
                     )
             await self._save_state(key, context)
             if engine == "google":
-                await self._update_google_auth_after_search(page, context, results)
+                await self._update_google_login_status(key, route, page, context, results)
             return {"ok": True, "status": "ok", "route": route.name, "results": results}
         except Exception as exc:
             try:
@@ -1272,213 +1086,24 @@ class BrowserSearchManager:
                 route=route.name,
             )
 
-    async def _wait_route_cooldown(
-        self, request: SearchRequest, route: Route
-    ) -> None:
-        key = self._context_key(route, request.locale, request.engine or "google")
-        deadline = self._route_cooldowns.get(key, 0.0)
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            self._route_cooldowns.pop(key, None)
-            return
-        _timing_event(
-            request,
-            "route_cooldown_wait",
-            route=route.name,
-            wait_ms=round(remaining * 1000, 3),
-        )
-        await asyncio.sleep(remaining)
-        self._route_cooldowns.pop(key, None)
-
-    def _mark_route_cooldown(self, request: SearchRequest, route: Route) -> None:
-        if self.route_cooldown_seconds <= 0:
-            return
-        key = self._context_key(route, request.locale, request.engine or "google")
-        self._route_cooldowns[key] = time.monotonic() + self.route_cooldown_seconds
-
-    async def _settle_route(
-        self,
-        request: SearchRequest,
-        route: Route,
-        result: dict[str, Any],
-        attempts: int,
-    ) -> tuple[dict[str, Any], int]:
-        route_failure = result.get("status") in {
-            "blocked",
-            "rate_limited",
-            "route_error",
-        }
-        if result.get("ok") or not route_failure:
-            return result, attempts
-        if result.get("reason") in {"javascript_required", "browser_update_required"}:
-            await self._close_route(
-                route,
-                clear_cookies=False,
-                engine=request.engine or "google",
-                locale=request.locale,
-                reason=result.get("reason", "route_failure"),
-            )
-            return result, attempts
-        challenge = result.get("reason") in {
-            "google_challenge_url",
-            "duckduckgo_challenge_url",
-            "captcha",
-            "consent_required",
-            "unusual_traffic",
-        }
-        if challenge and self.recovery_retries_per_route > 0:
-            # Never retry a challenge in the same Context.  It may already
-            # contain a challenge/abuse token; recreate from the last known
-            # good state first, then fall back to a clean Context on the next
-            # queued request if this recovery also fails.
-            await self._close_route(
-                route,
-                clear_cookies=False,
-                engine=request.engine or "google",
-                locale=request.locale,
-                reason="challenge_before_recovery",
-            )
-            if self.challenge_retry_delay:
-                await asyncio.sleep(self.challenge_retry_delay)
-            _timing_event(
-                request,
-                "route_recovery_started",
-                route=route.name,
-                recovery_attempt=1,
-                state="last_good",
-            )
-            result = await self._perform(request, route)
-            attempts += 1
-            if result.get("ok") or result.get("status") not in {
-                "blocked",
-                "rate_limited",
-                "route_error",
-            }:
-                self._route_cooldowns.pop(
-                    self._context_key(
-                        route, request.locale, request.engine or "google"
-                    ),
-                    None,
-                )
-                return result, attempts
-            await self._close_route(
-                route,
-                clear_cookies=True,
-                engine=request.engine or "google",
-                locale=request.locale,
-                reason="challenge_recovery_failed",
-            )
-            self._mark_route_cooldown(request, route)
-            _timing_event(
-                request,
-                "route_recovery_failed",
-                route=route.name,
-                cooldown_seconds=self.route_cooldown_seconds,
-                next_state="clean",
-            )
-            return result, attempts
-        await self._close_route(
-            route,
-            clear_cookies=True,
-            engine=request.engine or "google",
-            locale=request.locale,
-            reason="route_failure",
-        )
-        self._mark_route_cooldown(request, route)
-        return result, attempts
-
     async def search(self, request: SearchRequest) -> dict[str, Any]:
-        """Search with Context recovery, then optional proxy rotation."""
+        """Search once using the single configured route (proxy if enabled, else direct)."""
 
         started_at = time.perf_counter()
         await self.start()
-        direct = Route("direct", "direct")
-        result = await self._perform(request, direct)
-        attempts = 1
-        result, attempts = await self._settle_route(request, direct, result, attempts)
-        routes_tried = 1
-        recoveries = max(0, attempts - 1)
-        route_failure = result.get("status") in {
-            "blocked",
-            "rate_limited",
-            "route_error",
-        }
-        configuration_failure = result.get("reason") in {
-            "javascript_required",
-            "browser_update_required",
-        }
-        if result.get("ok") or not route_failure or configuration_failure:
-            final = {
-                **result,
-                "attempts": attempts,
-                "routes_tried": routes_tried,
-                "recoveries": recoveries,
-            }
-            _timing_event(
-                request,
-                "search_completed",
-                elapsed_ms=_elapsed_ms(started_at),
-                attempts=attempts,
-                status=result.get("status", ""),
-                reason=result.get("reason", ""),
-                result_count=len(result.get("results", [])),
-            )
-            return final
-        if routes_tried >= self.max_route_attempts or not self.proxy_pool_enabled:
-            final = {
-                **result,
-                "attempts": attempts,
-                "routes_tried": routes_tried,
-                "recoveries": recoveries,
-            }
-            _timing_event(
-                request,
-                "search_completed",
-                elapsed_ms=_elapsed_ms(started_at),
-                attempts=attempts,
-                status=result.get("status", ""),
-                reason=result.get("reason", ""),
-                result_count=len(result.get("results", [])),
-            )
-            return final
-
-        for proxy in self.proxy_pool.round():
-            if routes_tried >= self.max_route_attempts:
-                break
-            route = Route(proxy.display_name, proxy.key, proxy)
-            result = await self._perform(request, route)
-            attempts += 1
-            routes_tried += 1
-            result, attempts = await self._settle_route(
-                request, route, result, attempts
-            )
-            recoveries = max(0, attempts - routes_tried)
-            configuration_failure = result.get("reason") in {
-                "javascript_required",
-                "browser_update_required",
-            }
-            if (
-                result.get("ok")
-                or result.get("status")
-                not in {
-                    "blocked",
-                    "rate_limited",
-                    "route_error",
-                }
-                or configuration_failure
-            ):
-                break
+        route = self._active_route()
+        result = await self._perform(request, route)
         final = {
             **result,
-            "attempts": attempts,
-            "routes_tried": routes_tried,
-            "recoveries": recoveries,
+            "attempts": 1,
+            "routes_tried": 1,
+            "recoveries": 0,
         }
         _timing_event(
             request,
             "search_completed",
             elapsed_ms=_elapsed_ms(started_at),
-            attempts=attempts,
+            attempts=1,
             status=result.get("status", ""),
             reason=result.get("reason", ""),
             result_count=len(result.get("results", [])),
@@ -1487,16 +1112,26 @@ class BrowserSearchManager:
 
     async def warm(self, locale: str = "zh-CN") -> None:
         await self.start()
-        await self._context(Route("direct", "direct"), locale, "google")
+        route = self._active_route()
+        await self._context(route, locale, "google")
         logger.info(
-            "browser-search warmup locale=%s contexts=%s", locale, len(self._contexts)
+            "browser-search warmup route=%s locale=%s contexts=%s",
+            route.name,
+            locale,
+            len(self._contexts),
         )
 
-    async def reload_google_auth(
-        self, *, clear_route_states: bool = False
-    ) -> dict[str, Any]:
-        """Discard cached Google contexts so newly imported/cleared auth takes effect."""
+    def google_login_status(self) -> dict[str, Any]:
+        route = self._active_route()
+        key = self._context_key(route, "zh-CN", "google")
+        return get_route_login_status(self._state_path(key), route_name=route.name)
 
+    async def clear_google_session(self) -> dict[str, Any]:
+        """Close Google contexts and clear saved Google session/login files."""
+
+        async with self._ensure_verify_lock():
+            if self._verify_session and self._verify_session.get("engine") == "google":
+                await self._close_verify_session_locked()
         if self._context_lock is not None:
             async with self._context_lock:
                 google_keys = [
@@ -1518,20 +1153,57 @@ class BrowserSearchManager:
                             logger.debug(
                                 "failed to close google context %s", key, exc_info=True
                             )
-                for key in [k for k in list(self._route_cooldowns) if k.startswith("google")]:
-                    self._route_cooldowns.pop(key, None)
-                for key in [
-                    k for k in list(self._force_clean_context) if k.startswith("google")
-                ]:
-                    self._force_clean_context.discard(key)
-        if clear_route_states:
-            for candidate in self.profile_root.glob("google-*"):
-                state_file = candidate / "storage-state.json"
-                try:
-                    state_file.unlink(missing_ok=True)
-                except OSError:
-                    pass
-        return get_google_auth_status(self.google_auth_state_path)
+        clear_route_auth_files(self.profile_root)
+        self._last_challenges.pop("google", None)
+        return self.google_login_status()
+
+    async def reload_proxy_config(self, proxy_config: dict[str, Any]) -> dict[str, Any]:
+        """Apply updated single-proxy / direct configuration immediately."""
+
+        new_pool = ProxyPool(proxy_config.get("entries", []))
+        new_enabled = bool(proxy_config.get("enabled", False)) and new_pool.primary is not None
+        old_route = self._active_route()
+        self.proxy_pool = new_pool
+        self.proxy_pool_enabled = new_enabled
+        new_route = self._active_route()
+        if old_route != new_route:
+            async with self._ensure_verify_lock():
+                if self._verify_session is not None:
+                    await self._close_verify_session_locked()
+            if self._context_lock is not None:
+                async with self._context_lock:
+                    for key in list(self._contexts):
+                        context = self._contexts.get(key)
+                        active = self._context_active_pages.get(key, 0)
+                        if active:
+                            self._pending_context_close.add(key)
+                            continue
+                        self._contexts.pop(key, None)
+                        self._context_locales.pop(key, None)
+                        self._context_active_pages.pop(key, None)
+                        if context is not None:
+                            try:
+                                await context.close()
+                            except Exception:
+                                logger.debug(
+                                    "failed to close context %s on proxy reload",
+                                    key,
+                                    exc_info=True,
+                                )
+            for bridge in list(self._socks_bridges.values()):
+                bridge.close()
+            self._socks_bridges.clear()
+            self._last_challenges.clear()
+            logger.info(
+                "browser-search proxy config updated old_route=%s new_route=%s",
+                old_route.name,
+                new_route.name,
+            )
+        return {
+            "ok": True,
+            "route": new_route.name,
+            "proxy_enabled": self.proxy_pool_enabled,
+        }
 
     def _ensure_verify_lock(self) -> asyncio.Lock:
         if self._verify_lock is None:
@@ -1607,26 +1279,28 @@ class BrowserSearchManager:
         key = sess["context_key"]
         context = sess["context"]
         engine = sess["engine"]
+        page = sess["page"]
+        mode = sess.get("mode", "verify")
         await self._save_state(key, context)
-        self._force_clean_context.discard(key)
-        self._route_cooldowns.pop(key, None)
-        if engine == "google" and self.persist_google_auth and self.google_auth_state_path.exists():
-            try:
-                raw_state = await context.storage_state()
-                if isinstance(raw_state, dict):
-                    google_state = extract_google_storage_state(raw_state)
-                    existing = load_google_auth_state(self.google_auth_state_path)
-                    merged = merge_storage_states(existing, google_state)
-                    if merged.get("cookies"):
-                        save_google_auth_state(
-                            self.google_auth_state_path,
-                            merged,
-                            source_format="refresh",
-                            last_auth_ok=True if has_google_auth_cookies(merged["cookies"]) else None,
-                            last_reason="manual_verify",
-                        )
-            except Exception:
-                logger.debug("failed to refresh google auth after manual verify", exc_info=True)
+        if engine == "google":
+            auth_ok, auth_reason = await self._inspect_google_auth(page, context, [])
+            if auth_ok is None:
+                try:
+                    cookies = await context.cookies(
+                        ["https://www.google.com", "https://accounts.google.com"]
+                    )
+                    if has_google_auth_cookies(cookies):
+                        auth_ok = True
+                        auth_reason = "browser_login" if mode == "login" else "manual_verify"
+                except Exception:
+                    pass
+            if auth_ok is not None:
+                write_route_auth_meta(
+                    self._state_path(key),
+                    logged_in=auth_ok,
+                    reason=auth_reason or ("browser_login" if mode == "login" else "manual_verify"),
+                    route=sess["route"].name,
+                )
         challenge = self._last_challenges.get(engine)
         if isinstance(challenge, dict):
             challenge["solved"] = True
@@ -1641,7 +1315,8 @@ class BrowserSearchManager:
                 "active": False,
                 "session_id": "",
                 "engine": engine,
-                "route": (last_challenge or {}).get("route", "direct"),
+                "mode": "verify",
+                "route": self._active_route().name,
                 "current_url": "",
                 "title": "",
                 "reason": (last_challenge or {}).get("reason", ""),
@@ -1654,6 +1329,7 @@ class BrowserSearchManager:
             "active": True,
             "session_id": sess["session_id"],
             "engine": sess["engine"],
+            "mode": sess.get("mode", "verify"),
             "route": sess["route"].name,
             "current_url": sess.get("current_url", ""),
             "title": sess.get("title", ""),
@@ -1669,6 +1345,7 @@ class BrowserSearchManager:
         page = sess["page"]
         context = sess["context"]
         engine = sess["engine"]
+        mode = sess.get("mode", "verify")
         if (time.monotonic() - sess["last_activity_at"]) > self._verify_idle_ttl:
             await self._close_verify_session_locked()
             return self._serialize_verify_status(engine, None)
@@ -1691,7 +1368,23 @@ class BrowserSearchManager:
 
         solved = False
         if not reason:
-            if engine == "duckduckgo":
+            if engine == "google" and mode == "login":
+                if self._is_google_results_or_exempt_url(current_url):
+                    auth_ok, auth_reason = await self._inspect_google_auth(
+                        page, context, []
+                    )
+                    if auth_ok is True:
+                        solved = True
+                    elif auth_reason != "session_logged_out":
+                        try:
+                            cookies = await context.cookies(
+                                ["https://www.google.com", "https://accounts.google.com"]
+                            )
+                            if has_google_auth_cookies(cookies):
+                                solved = True
+                        except Exception:
+                            pass
+            elif engine == "duckduckgo":
                 host = (urlparse(current_url).hostname or "").lower()
                 if (host == "duckduckgo.com" or host.endswith(".duckduckgo.com")) and (
                     await self._wait_for_results(page, "duckduckgo", 60)
@@ -1716,23 +1409,26 @@ class BrowserSearchManager:
             sess["solved"] = True
             self._schedule_verify_close(sess["session_id"], delay=3.0)
             logger.info(
-                "browser-search-verify-solved engine=%s route=%s url=%s",
+                "browser-search-verify-solved engine=%s mode=%s route=%s url=%s",
                 engine,
+                mode,
                 sess["route"].name,
                 current_url,
             )
         return self._serialize_verify_status(engine, sess)
 
-    def _resolve_verify_route(self, engine: str) -> tuple[Route, str, str]:
+    def _resolve_verify_route(
+        self, engine: str, mode: str = "verify"
+    ) -> tuple[Route, str, str]:
         challenge = self._last_challenges.get(engine) or {}
         locale = self._normalize_locale(challenge.get("locale"), default="zh-CN") or "zh-CN"
-        profile_key = str(challenge.get("profile_key") or "direct")
-        route = Route("direct", "direct")
-        if profile_key != "direct" and self.proxy_pool_enabled:
-            for proxy in self.proxy_pool.round():
-                if proxy.key == profile_key:
-                    route = Route(proxy.display_name, proxy.key, proxy)
-                    break
+        route = self._active_route()
+        if engine == "google" and mode == "login":
+            login_url = (
+                "https://accounts.google.com/ServiceLogin?"
+                + urlencode({"continue": "https://www.google.com/", "hl": locale})
+            )
+            return route, locale, login_url
         default_url = (
             "https://duckduckgo.com/?q=test"
             if engine == "duckduckgo"
@@ -1756,11 +1452,20 @@ class BrowserSearchManager:
             return await self._refresh_verify_state_locked(sess)
 
     async def verify_start(
-        self, engine: str = "google", url: str | None = None, force_new: bool = False
+        self,
+        engine: str = "google",
+        url: str | None = None,
+        force_new: bool = False,
+        mode: str = "verify",
     ) -> dict[str, Any]:
         engine_name = (engine or "google").strip().lower()
         if engine_name not in self.SUPPORTED_ENGINES:
             return {"ok": False, "status": "invalid_request", "reason": f"unsupported_engine:{engine_name}"}
+        session_mode = (
+            "login"
+            if engine_name == "google" and str(mode or "").strip().lower() == "login"
+            else "verify"
+        )
         await self.start()
         async with self._ensure_verify_lock():
             existing = self._verify_session
@@ -1768,6 +1473,7 @@ class BrowserSearchManager:
                 existing is not None
                 and not force_new
                 and existing["engine"] == engine_name
+                and existing.get("mode", "verify") == session_mode
                 and not getattr(existing["page"], "is_closed", lambda: False)()
                 and (time.monotonic() - existing["last_activity_at"]) <= self._verify_idle_ttl
             ):
@@ -1783,15 +1489,14 @@ class BrowserSearchManager:
             if existing is not None:
                 await self._close_verify_session_locked()
 
-            route, locale, default_target = self._resolve_verify_route(engine_name)
+            route, locale, default_target = self._resolve_verify_route(
+                engine_name, mode=session_mode
+            )
             target_url = (
                 url
                 if url and self._is_verify_url_allowed(engine_name, url)
                 else default_target
             )
-            key = self._context_key(route, locale, engine_name)
-            self._force_clean_context.discard(key)
-            self._route_cooldowns.pop(key, None)
             key, context = await self._context(route, locale, engine_name)
             page = await context.new_page()
             self._context_active_pages[key] = self._context_active_pages.get(key, 0) + 1
@@ -1813,6 +1518,7 @@ class BrowserSearchManager:
             sess = {
                 "session_id": secrets.token_urlsafe(12),
                 "engine": engine_name,
+                "mode": session_mode,
                 "route": route,
                 "locale": locale,
                 "context_key": key,
@@ -2105,22 +1811,34 @@ class BrowserSearchDispatcher:
         future = asyncio.run_coroutine_threadsafe(coro, self._loop)
         return future.result(timeout=timeout)
 
-    def reload_google_auth(self, *, clear_route_states: bool = False) -> dict[str, Any]:
-        return self._call_manager(
-            "reload_google_auth", clear_route_states=clear_route_states, timeout=30
-        )
+    def clear_google_session(self) -> dict[str, Any]:
+        return self._call_manager("clear_google_session", timeout=30)
 
-    def google_auth_status(self) -> dict[str, Any]:
-        return get_google_auth_status(resolve_google_auth_path(self.config))
+    def reload_proxy_config(self, proxy_config: dict[str, Any]) -> dict[str, Any]:
+        return self._call_manager("reload_proxy_config", proxy_config, timeout=30)
+
+    def google_login_status(self) -> dict[str, Any]:
+        if self._manager is None:
+            raise RuntimeError("browser search runtime is not initialized")
+        return self._manager.google_login_status()
 
     def verify_status(self, engine: str = "google") -> dict[str, Any]:
         return self._call_manager("verify_status", engine, timeout=15)
 
     def verify_start(
-        self, engine: str = "google", url: str | None = None, force_new: bool = False
+        self,
+        engine: str = "google",
+        url: str | None = None,
+        force_new: bool = False,
+        mode: str = "verify",
     ) -> dict[str, Any]:
         return self._call_manager(
-            "verify_start", engine=engine, url=url, force_new=force_new, timeout=45
+            "verify_start",
+            engine=engine,
+            url=url,
+            force_new=force_new,
+            mode=mode,
+            timeout=45,
         )
 
     def verify_frame(

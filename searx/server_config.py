@@ -14,12 +14,10 @@ import yaml
 
 from . import settings, settings_loader
 from .browser_search.auth_state import (
-    clear_google_auth_state,
-    get_google_auth_status,
-    parse_google_cookies_input,
-    resolve_google_auth_path,
-    save_google_auth_state,
+    clear_route_auth_files,
+    get_route_login_status,
 )
+from .browser_search.proxy_pool import resolve_active_proxy
 
 
 def settings_file() -> Path:
@@ -114,20 +112,32 @@ def snapshot() -> dict[str, Any]:
 
     proxy_pool = settings.get("outgoing", {}).get("proxy_pool", {}) or {}
     browser_cfg = settings.get("browser_search", {}) or {}
-    google_auth = get_google_auth_status(resolve_google_auth_path(browser_cfg))
+    entries = list(proxy_pool.get("entries", []) or [])
+    profile_dir = Path(
+        str(browser_cfg.get("profile_dir", "")).strip()
+        or "/var/lib/searxng/browser-profiles"
+    )
+    active_proxy = resolve_active_proxy(browser_cfg, proxy_pool)
+    if active_proxy is not None:
+        route_name = active_proxy.display_name
+        state_path = profile_dir / f"google-{active_proxy.key}" / "storage-state.json"
+    else:
+        route_name = "direct"
+        state_path = profile_dir / "google-direct" / "storage-state.json"
+    google_auth = get_route_login_status(state_path, route_name=route_name)
     return {
         "engines": engine_rows,
         "proxy_pool": {
             "enabled": bool(proxy_pool.get("enabled", False)),
-            "entries": list(proxy_pool.get("entries", []) or []),
-            "max_attempts": min(3, max(1, int(proxy_pool.get("max_attempts", 3)))),
+            "entries": entries[:1],
+            "proxy": entries[0] if entries else "",
         },
         "browser_search_enabled": bool(browser_cfg.get("enabled", False)),
         "google_auth": google_auth,
     }
 
 
-def _notify_browser_worker(payload: dict[str, Any]) -> None:
+def _notify_browser_worker(path: str, payload: dict[str, Any]) -> None:
     browser_cfg = settings.get("browser_search", {}) or {}
     if not browser_cfg.get("enabled"):
         return
@@ -135,41 +145,30 @@ def _notify_browser_worker(payload: dict[str, Any]) -> None:
     if not endpoint:
         return
     try:
-        httpx.post(f"{endpoint}/v1/auth/google", json=payload, timeout=5.0)
+        httpx.post(f"{endpoint}{path}", json=payload, timeout=5.0)
     except Exception:
         pass
 
 
-def import_google_auth(raw_cookies: str) -> dict[str, Any]:
-    """Parse and persist imported Google login cookies and notify the browser worker."""
-
-    browser_cfg = settings.get("browser_search", {}) or {}
-    auth_path = resolve_google_auth_path(browser_cfg)
-    state, source_format = parse_google_cookies_input(
-        raw_cookies, require_auth_cookies=True
-    )
-    status = save_google_auth_state(auth_path, state, source_format=source_format)
-    _notify_browser_worker({"action": "reload", "clear_route_states": False})
-    return status
-
-
 def clear_google_auth() -> dict[str, Any]:
-    """Remove saved Google login cookies and reset cached Google browser contexts."""
+    """Clear saved Google browser session state and reset cached Google contexts."""
 
     browser_cfg = settings.get("browser_search", {}) or {}
-    auth_path = resolve_google_auth_path(browser_cfg)
-    status = clear_google_auth_state(auth_path)
-    profile_dir = (
+    proxy_pool = settings.get("outgoing", {}).get("proxy_pool", {}) or {}
+    profile_dir = Path(
         str(browser_cfg.get("profile_dir", "")).strip()
         or "/var/lib/searxng/browser-profiles"
     )
-    for candidate in Path(profile_dir).glob("google-*"):
-        try:
-            (candidate / "storage-state.json").unlink(missing_ok=True)
-        except OSError:
-            pass
-    _notify_browser_worker({"action": "clear"})
-    return status
+    clear_route_auth_files(profile_dir)
+    _notify_browser_worker("/v1/auth/google", {"action": "clear"})
+    active_proxy = resolve_active_proxy(browser_cfg, proxy_pool)
+    if active_proxy is not None:
+        route_name = active_proxy.display_name
+        state_path = profile_dir / f"google-{active_proxy.key}" / "storage-state.json"
+    else:
+        route_name = "direct"
+        state_path = profile_dir / "google-direct" / "storage-state.json"
+    return get_route_login_status(state_path, route_name=route_name)
 
 
 def _write_yaml(path: Path, value: dict[str, Any]) -> None:
@@ -204,19 +203,14 @@ def save(form: Any) -> dict[str, Any]:
         for key, value in form.items()
         if str(key).startswith("server_engine__") and str(value).strip()
     }
-    proxy_entries = _valid_proxy_entries(
-        str(form.get("http_proxy_pool_entries", "")).splitlines()
-    )
-    try:
-        proxy_max_attempts = int(form.get("http_proxy_pool_max_attempts", 3))
-    except (TypeError, ValueError):
-        proxy_max_attempts = 3
-    proxy_max_attempts = min(3, max(1, proxy_max_attempts))
+    raw_proxy = form.get("http_proxy_url")
+    if raw_proxy is None:
+        raw_proxy = form.get("http_proxy_pool_entries", "")
+    proxy_entries = _valid_proxy_entries(str(raw_proxy).splitlines())[:1]
 
     proxy_pool = {
         "enabled": form.get("http_proxy_pool_enabled") == "on",
         "entries": proxy_entries,
-        "max_attempts": proxy_max_attempts,
     }
     path = settings_file()
     user_cfg = _load_user_settings(path)
@@ -240,4 +234,5 @@ def save(form: Any) -> dict[str, Any]:
         check_network=False,
         enable_metrics=bool(settings.get("general", {}).get("enable_metrics", True)),
     )
+    _notify_browser_worker("/v1/config/reload", {"proxy_pool": proxy_pool})
     return snapshot()

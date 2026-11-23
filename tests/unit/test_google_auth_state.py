@@ -2,10 +2,10 @@
 # pylint: disable=missing-module-docstring,missing-class-docstring
 
 import json
-import os
 from pathlib import Path
 import tempfile
 import threading
+import time
 from unittest import IsolatedAsyncioTestCase, TestCase
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -13,230 +13,197 @@ import httpx
 
 from searx import server_config, settings
 from searx.browser_search.auth_state import (
-    clear_google_auth_state,
-    get_google_auth_status,
-    merge_storage_states,
-    parse_google_cookies_input,
-    save_google_auth_state,
+    clear_route_auth_files,
+    get_route_login_status,
+    has_google_auth_cookies,
+    write_route_auth_meta,
 )
 from searx.browser_search.manager import BrowserSearchManager, Route
 from searx.browser_search.server import BrowserSearchHTTPServer
 
 
-SAMPLE_HEADER = (
-    "HSID=abc1; SSID=abc2; APISID=a/b; SAPISID=c/d; "
-    "S=billing-ui-v3=foo:bar=baz; "
-    "SID=sidval; __Secure-1PSID=psid1; __Secure-3PSID=psid3; "
-    "__Secure-1PSIDTS=ts1; NID=nidval"
-)
+class GoogleBrowserLoginStateTests(TestCase):
 
-
-class AuthStateParserTests(TestCase):
-
-    def test_parses_cookie_header_with_equals_in_value(self):
-        state, fmt = parse_google_cookies_input(f"Cookie: {SAMPLE_HEADER}")
-        self.assertEqual("cookie_header", fmt)
-        by_name = {c["name"]: c for c in state["cookies"]}
-        self.assertEqual("billing-ui-v3=foo:bar=baz", by_name["S"]["value"])
-        self.assertTrue(by_name["__Secure-3PSID"]["secure"])
-        self.assertEqual("None", by_name["__Secure-3PSID"]["sameSite"])
-        self.assertTrue(by_name["SID"]["httpOnly"])
-        self.assertEqual(".google.com", by_name["SID"]["domain"])
-        self.assertGreater(by_name["SID"]["expires"], 0)
-
-    def test_parses_cookie_editor_json_array(self):
-        payload = json.dumps(
-            [
-                {
-                    "name": "SID",
-                    "value": "s1",
-                    "domain": ".google.com",
-                    "path": "/",
-                    "httpOnly": True,
-                    "secure": True,
-                    "sameSite": "no_restriction",
-                    "expirationDate": 1893456000,
-                },
-                {
-                    "name": "unrelated",
-                    "value": "dropme",
-                    "domain": ".example.com",
-                    "path": "/",
-                },
-            ]
-        )
-        state, fmt = parse_google_cookies_input(payload)
-        self.assertEqual("cookie_json", fmt)
-        self.assertEqual(1, len(state["cookies"]))
-        self.assertEqual("None", state["cookies"][0]["sameSite"])
-        self.assertEqual(1893456000, state["cookies"][0]["expires"])
-
-    def test_parses_netscape_cookies_txt(self):
-        netscape = (
-            "# Netscape HTTP Cookie File\n"
-            "#HttpOnly_.google.com\tTRUE\t/\tTRUE\t1893456000\t__Secure-1PSID\tval1\n"
-            ".google.com\tTRUE\t/\tFALSE\t1893456000\tPREF\ttz=UTC\n"
-        )
-        state, fmt = parse_google_cookies_input(netscape)
-        self.assertEqual("netscape", fmt)
-        by_name = {c["name"]: c for c in state["cookies"]}
-        self.assertTrue(by_name["__Secure-1PSID"]["httpOnly"])
-        self.assertTrue(by_name["__Secure-1PSID"]["secure"])
-        self.assertEqual("tz=UTC", by_name["PREF"]["value"])
-
-    def test_rejects_missing_core_google_auth_cookies(self):
-        with self.assertRaises(ValueError):
-            parse_google_cookies_input("PREF=tz=UTC; NID=only_nid")
-
-    def test_merge_storage_states_prefers_override_cookies(self):
-        base = {
-            "cookies": [
-                {"name": "SID", "value": "old", "domain": ".google.com", "path": "/"},
-                {"name": "SOCS", "value": "keep", "domain": ".google.com", "path": "/"},
-            ],
-            "origins": [],
-        }
-        override = {
-            "cookies": [
-                {"name": "SID", "value": "new", "domain": ".google.com", "path": "/"},
-            ],
-            "origins": [],
-        }
-        merged = merge_storage_states(base, override)
-        by_name = {c["name"]: c["value"] for c in merged["cookies"]}
-        self.assertEqual("new", by_name["SID"])
-        self.assertEqual("keep", by_name["SOCS"])
-
-
-class ManagerGoogleAuthTests(IsolatedAsyncioTestCase):
-
-    async def test_force_clean_context_still_keeps_imported_google_auth(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            auth_path = Path(tmpdir) / "google-auth-state.json"
-            state, fmt = parse_google_cookies_input(SAMPLE_HEADER)
-            save_google_auth_state(auth_path, state, source_format=fmt)
-
-            manager = BrowserSearchManager(
-                {
-                    "profile_dir": tmpdir,
-                    "google_auth_state_file": str(auth_path),
-                }
+    def test_has_google_auth_cookies_respects_expiry(self):
+        future = time.time() + 3600
+        past = time.time() - 60
+        self.assertTrue(
+            has_google_auth_cookies(
+                [{"name": "SID", "value": "ok", "domain": ".google.com", "expires": future}]
             )
-            fake_context = Mock()
-            fake_context.add_init_script = AsyncMock()
-            fake_context.storage_state = AsyncMock(return_value=state)
-            fake_browser = Mock()
-            fake_browser.new_context = AsyncMock(return_value=fake_context)
-            manager._browser = fake_browser
+        )
+        self.assertFalse(
+            has_google_auth_cookies(
+                [{"name": "SID", "value": "old", "domain": ".google.com", "expires": past}]
+            )
+        )
+        self.assertFalse(
+            has_google_auth_cookies(
+                [{"name": "NID", "value": "anon", "domain": ".google.com", "expires": future}]
+            )
+        )
 
-            route = Route("direct", "direct")
-            key = manager._context_key(route, "zh-CN", "google")
-            route_state_file = manager._state_path(key)
-            route_state_file.write_text(
+    def test_route_login_status_and_clear_removes_legacy_files(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            state_path = root / "google-direct" / "storage-state.json"
+            state_path.parent.mkdir(parents=True, exist_ok=True)
+            state_path.write_text(
                 json.dumps(
                     {
                         "cookies": [
                             {
                                 "name": "SID",
-                                "value": "stale",
+                                "value": "sidval",
                                 "domain": ".google.com",
                                 "path": "/",
-                            },
-                            {
-                                "name": "STALE_CHALLENGE",
-                                "value": "bad",
-                                "domain": ".google.com",
-                                "path": "/",
-                            },
+                                "expires": time.time() + 3600,
+                            }
                         ],
                         "origins": [],
                     }
                 ),
                 encoding="utf-8",
             )
-            manager._force_clean_context.add(key)
-
-            await manager._create_context(route, "zh-CN", key)
-
-            kwargs = fake_browser.new_context.call_args.kwargs
-            passed_cookies = {
-                c["name"]: c["value"] for c in kwargs["storage_state"]["cookies"]
-            }
-            self.assertEqual("sidval", passed_cookies["SID"])
-            self.assertNotIn("STALE_CHALLENGE", passed_cookies)
-
-    async def test_logged_out_page_does_not_overwrite_saved_google_auth(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            auth_path = Path(tmpdir) / "google-auth-state.json"
-            state, fmt = parse_google_cookies_input(SAMPLE_HEADER)
-            save_google_auth_state(auth_path, state, source_format=fmt)
-
-            manager = BrowserSearchManager(
-                {
-                    "profile_dir": tmpdir,
-                    "google_auth_state_file": str(auth_path),
-                    "persist_google_auth": True,
-                }
+            legacy_file = root / "google-auth-state.json"
+            legacy_file.write_text("{}", encoding="utf-8")
+            write_route_auth_meta(
+                state_path, logged_in=True, reason="browser_login", route="direct"
             )
+
+            status = get_route_login_status(state_path, route_name="direct")
+            self.assertTrue(status["has_session"])
+            self.assertTrue(status["has_auth_cookies"])
+            self.assertIs(status["logged_in"], True)
+            self.assertEqual("browser_login", status["reason"])
+
+            clear_route_auth_files(root)
+            self.assertFalse(state_path.exists())
+            self.assertFalse(legacy_file.exists())
+            cleared = get_route_login_status(state_path, route_name="direct")
+            self.assertFalse(cleared["has_session"])
+            self.assertFalse(cleared["has_auth_cookies"])
+            self.assertIsNone(cleared["logged_in"])
+
+
+class ManagerGoogleLoginTests(IsolatedAsyncioTestCase):
+
+    async def test_logged_out_page_updates_route_auth_meta(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = BrowserSearchManager({"profile_dir": tmpdir})
+            route = Route("direct", "direct")
+            key = manager._context_key(route, "zh-CN", "google")
+
             fake_page = Mock()
             fake_page.evaluate = AsyncMock(
                 return_value={"hasLoginLink": True, "hasAccountUi": False}
             )
             fake_context = Mock()
             fake_context.cookies = AsyncMock(return_value=[])
-            fake_context.storage_state = AsyncMock(
-                return_value={"cookies": [], "origins": []}
-            )
 
-            await manager._update_google_auth_after_search(
+            await manager._update_google_login_status(
+                key,
+                route,
                 fake_page,
                 fake_context,
                 [{"title": "t", "url": "https://www.google.com/goto?url=abc"}],
             )
 
-            status = get_google_auth_status(auth_path)
-            self.assertTrue(status["configured"])
-            self.assertIs(status["last_auth_ok"], False)
-            self.assertEqual("session_logged_out", status["last_reason"])
+            status = manager.google_login_status()
+            self.assertIs(status["logged_in"], False)
+            self.assertEqual("session_logged_out", status["reason"])
+
+    async def test_clear_google_session_closes_contexts_and_deletes_state(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = BrowserSearchManager({"profile_dir": tmpdir})
+            state_path = manager._state_path("google-direct")
+            state_path.write_text('{"cookies": [], "origins": []}', encoding="utf-8")
+            fake_ctx = AsyncMock()
+            manager._context_lock = AsyncMock()
+            manager._context_lock.__aenter__ = AsyncMock(return_value=None)
+            manager._context_lock.__aexit__ = AsyncMock(return_value=False)
+            manager._contexts["google-direct"] = fake_ctx
+            manager._context_active_pages["google-direct"] = 0
+
+            status = await manager.clear_google_session()
+
+            fake_ctx.close.assert_awaited_once()
+            self.assertNotIn("google-direct", manager._contexts)
+            self.assertFalse(state_path.exists())
+            self.assertFalse(status["has_session"])
 
 
-class ServerConfigGoogleAuthTests(TestCase):
+class ServerConfigGoogleLoginTests(TestCase):
 
-    def test_import_and_clear_google_auth(self):
+    def test_snapshot_and_clear_google_auth_use_active_route(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             fake_settings = {
                 "engines": [],
-                "outgoing": {"proxy_pool": {}},
+                "outgoing": {
+                    "proxy_pool": {
+                        "enabled": True,
+                        "entries": ["socks5://proxy.test:1080"],
+                    }
+                },
                 "browser_search": {
                     "enabled": False,
                     "profile_dir": tmpdir,
-                    "google_auth_state_file": "",
                 },
             }
             with patch.dict(settings, fake_settings, clear=True):
-                status = server_config.import_google_auth(SAMPLE_HEADER)
-                self.assertTrue(status["configured"])
-                self.assertGreaterEqual(status["cookie_count"], 8)
                 snap = server_config.snapshot()
-                self.assertTrue(snap["google_auth"]["configured"])
+                self.assertEqual("socks5://proxy.test:1080", snap["google_auth"]["route"])
+                self.assertFalse(snap["google_auth"]["has_session"])
+
+                state_file = Path(snap["google_auth"]["state_file"])
+                state_file.parent.mkdir(parents=True, exist_ok=True)
+                state_file.write_text(
+                    json.dumps(
+                        {
+                            "cookies": [
+                                {
+                                    "name": "SID",
+                                    "value": "s",
+                                    "domain": ".google.com",
+                                    "expires": time.time() + 3600,
+                                }
+                            ],
+                            "origins": [],
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                snap2 = server_config.snapshot()
+                self.assertTrue(snap2["google_auth"]["has_auth_cookies"])
 
                 cleared = server_config.clear_google_auth()
-                self.assertFalse(cleared["configured"])
-                self.assertFalse((Path(tmpdir) / "google-auth-state.json").exists())
-                clear_google_auth_state(Path(tmpdir) / "google-auth-state.json")
+                self.assertFalse(cleared["has_session"])
+                self.assertFalse(state_file.exists())
 
 
 class WorkerAuthEndpointTests(TestCase):
 
-    def test_get_post_google_auth_endpoints(self):
+    def test_auth_and_config_reload_endpoints(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             fake_manager = Mock()
             fake_manager.config = {"profile_dir": tmpdir}
-            fake_manager.reload_google_auth = Mock(
-                side_effect=lambda **kwargs: get_google_auth_status(
-                    Path(tmpdir) / "google-auth-state.json"
-                )
-            )
+            fake_manager.google_login_status.return_value = {
+                "route": "direct",
+                "has_session": False,
+                "has_auth_cookies": False,
+                "logged_in": None,
+            }
+            fake_manager.clear_google_session.return_value = {
+                "route": "direct",
+                "has_session": False,
+                "has_auth_cookies": False,
+                "logged_in": None,
+            }
+            fake_manager.reload_proxy_config.return_value = {
+                "ok": True,
+                "route": "socks5://proxy.test:1080",
+                "proxy_enabled": True,
+            }
             server = BrowserSearchHTTPServer(("127.0.0.1", 0), fake_manager)
             port = server.server_address[1]
             thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -245,23 +212,14 @@ class WorkerAuthEndpointTests(TestCase):
                 base = f"http://127.0.0.1:{port}"
                 initial = httpx.get(f"{base}/v1/auth/google", timeout=5.0)
                 self.assertEqual(200, initial.status_code)
-                self.assertFalse(initial.json()["configured"])
+                self.assertEqual("direct", initial.json()["route"])
 
-                bad = httpx.post(
+                rejected = httpx.post(
                     f"{base}/v1/auth/google",
-                    json={"raw": "PREF=1"},
+                    json={"raw": "SID=abc"},
                     timeout=5.0,
                 )
-                self.assertEqual(400, bad.status_code)
-
-                imported = httpx.post(
-                    f"{base}/v1/auth/google",
-                    json={"raw": SAMPLE_HEADER},
-                    timeout=5.0,
-                )
-                self.assertEqual(200, imported.status_code)
-                self.assertTrue(imported.json()["configured"])
-                self.assertGreaterEqual(imported.json()["cookie_count"], 8)
+                self.assertEqual(400, rejected.status_code)
 
                 cleared = httpx.post(
                     f"{base}/v1/auth/google",
@@ -269,7 +227,20 @@ class WorkerAuthEndpointTests(TestCase):
                     timeout=5.0,
                 )
                 self.assertEqual(200, cleared.status_code)
-                self.assertFalse(cleared.json()["configured"])
+                fake_manager.clear_google_session.assert_called_once()
+
+                reloaded = httpx.post(
+                    f"{base}/v1/config/reload",
+                    json={
+                        "proxy_pool": {
+                            "enabled": True,
+                            "entries": ["socks5://proxy.test:1080"],
+                        }
+                    },
+                    timeout=5.0,
+                )
+                self.assertEqual(200, reloaded.status_code)
+                self.assertTrue(reloaded.json()["proxy_enabled"])
             finally:
                 server.shutdown()
                 server.server_close()

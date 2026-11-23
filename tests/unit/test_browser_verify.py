@@ -94,8 +94,6 @@ class ManagerVerificationTests(IsolatedAsyncioTestCase):
 
             context.storage_state = AsyncMock(side_effect=write_storage_state)
             manager._contexts["google-direct"] = context
-            manager._force_clean_context.add("google-direct")
-            manager._route_cooldowns["google-direct"] = 999999999.0
             manager._last_challenges["google"] = {
                 "engine": "google",
                 "route": "direct",
@@ -124,8 +122,6 @@ class ManagerVerificationTests(IsolatedAsyncioTestCase):
                 started = await manager.verify_start(engine="google")
                 self.assertTrue(started["active"])
                 self.assertFalse(started["solved"])
-                self.assertNotIn("google-direct", manager._force_clean_context)
-                self.assertNotIn("google-direct", manager._route_cooldowns)
 
                 blocked = await manager._perform(
                     SearchRequest("zero", engine="google", locale="zh-CN"),
@@ -180,6 +176,68 @@ class ManagerVerificationTests(IsolatedAsyncioTestCase):
             )
             self.assertFalse(res["ok"])
             self.assertEqual("disallowed verification URL", res["reason"])
+
+    async def test_login_mode_opens_google_signin_and_persists_session(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = BrowserSearchManager({"profile_dir": tmpdir})
+            manager._browser = object()
+            manager._start_lock = asyncio.Lock()
+            manager._context_lock = asyncio.Lock()
+
+            page = AsyncMock()
+            page.url = "https://accounts.google.com/ServiceLogin?continue=https%3A%2F%2Fwww.google.com%2F&hl=zh-CN"
+            page.title = AsyncMock(return_value="Sign in - Google Accounts")
+            page.is_closed = Mock(return_value=False)
+            page.goto = AsyncMock()
+            page.mouse = AsyncMock()
+            page.keyboard = AsyncMock()
+            page.evaluate = AsyncMock(
+                return_value={"hasLoginLink": False, "hasAccountUi": True}
+            )
+
+            context = AsyncMock()
+            context.new_page = AsyncMock(return_value=page)
+            context.cookies = AsyncMock(
+                return_value=[{"name": "SID", "value": "sid123", "domain": ".google.com"}]
+            )
+
+            async def write_storage_state(path=None):
+                payload = {
+                    "cookies": [
+                        {
+                            "name": "SID",
+                            "value": "sid123",
+                            "domain": ".google.com",
+                            "path": "/",
+                        }
+                    ],
+                    "origins": [],
+                }
+                if path:
+                    Path(path).write_text(json.dumps(payload), encoding="utf-8")
+                return payload
+
+            context.storage_state = AsyncMock(side_effect=write_storage_state)
+            manager._contexts["google-direct"] = context
+
+            with patch.object(
+                BrowserSearchManager,
+                "_block_reason",
+                new=AsyncMock(return_value=None),
+            ):
+                started = await manager.verify_start(engine="google", mode="login")
+                self.assertTrue(started["active"])
+                self.assertEqual("login", started["mode"])
+                self.assertFalse(started["solved"])
+                self.assertIn("accounts.google.com/ServiceLogin", page.goto.await_args.args[0])
+
+                page.url = "https://www.google.com/"
+                after_login = await manager.verify_status(engine="google")
+                self.assertTrue(after_login["solved"])
+                login_status = manager.google_login_status()
+                self.assertIs(login_status["logged_in"], True)
+                self.assertTrue(login_status["has_auth_cookies"])
+                await manager.verify_close()
 
 
 class WorkerVerifyEndpointTests(TestCase):
@@ -279,6 +337,10 @@ class WebappVerifyRouteTests(TestCase):
             page = client.get("/browser-verify?engine=google&q=test", headers=headers)
             self.assertEqual(200, page.status_code)
             self.assertIn("网页人机验证", page.get_data(as_text=True))
+
+            login_page = client.get("/browser-verify?engine=google&mode=login", headers=headers)
+            self.assertEqual(200, login_page.status_code)
+            self.assertIn("Google 账号登录", login_page.get_data(as_text=True))
 
             mock_resp = Mock()
             mock_resp.status_code = 200

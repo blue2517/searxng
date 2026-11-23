@@ -24,6 +24,8 @@ class ProxyEndpoint:
     def parse(cls, index: int, value: str) -> "ProxyEndpoint":
         parsed = urlsplit(value.strip())
         scheme = parsed.scheme.lower()
+        if scheme == "socks5h":
+            scheme = "socks5"
         if scheme not in {"socks5", "http", "https"}:
             raise ValueError(f"unsupported proxy scheme: {scheme or '<empty>'}")
         if not parsed.hostname or not parsed.port:
@@ -74,13 +76,27 @@ class ProxyPool:
     def entries(self) -> tuple[ProxyEndpoint, ...]:
         return tuple(self._entries)
 
-    def round(self) -> list[ProxyEndpoint]:
-        """Return each configured proxy at most once and advance the cursor."""
+    @property
+    def primary(self) -> ProxyEndpoint | None:
+        return self._entries[0] if self._entries else None
 
-        with self._lock:
-            if not self._entries:
-                return []
-            start = self._cursor % len(self._entries)
-            ordered = self._entries[start:] + self._entries[:start]
-            self._cursor = (start + 1) % len(self._entries)
-            return ordered
+    def round(self) -> list[ProxyEndpoint]:
+        """Return the single active proxy if configured."""
+
+        return [self._entries[0]] if self._entries else []
+
+
+def resolve_active_proxy(
+    browser_cfg: dict | None = None, outgoing_proxy_cfg: dict | None = None
+) -> ProxyEndpoint | None:
+    """Resolve the single active proxy endpoint, or None for direct connection."""
+
+    bp = (browser_cfg or {}).get("proxy_pool") or {}
+    if bp.get("entries"):
+        cfg = bp
+    else:
+        cfg = outgoing_proxy_cfg or {}
+    if not bool(cfg.get("enabled", False)):
+        return None
+    pool = ProxyPool(cfg.get("entries", []))
+    return pool.primary
